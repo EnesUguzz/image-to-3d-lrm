@@ -1,0 +1,28 @@
+# Render çıktıları / veri seti (çok büyük — repoya girmez)
+dataset/
+renders/
+views/
+*.glb
+*.png
+*.npy
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Model ağırlıkları / checkpoint'ler
+*.ckpt
+*.pth
+*.safetensors
+checkpoints/
+wandb/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
