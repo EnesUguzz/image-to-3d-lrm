@@ -27,9 +27,32 @@ doğrudan yükleyip eğitebileceği tutarlı bir `dataset/` klasörü. Çıktı 
 
 ## 3. Kamera Geometrisi (kesinleşmiş)
 
-Obje **birim küpe normalize** edilir: en büyük bbox boyutu = 1, merkez = origin.
-Kamera sabit yarıçapta (`radius = 1.5`), hep origin'e bakar (`TRACK_TO` empty).
+### 3.0 Normalizasyon & Çerçeveleme (framing tutarlılığı)
+
+Objeler boyut/şekil olarak çok değişir; tutarlı çerçeveleme için **obje kameraya göre
+ayarlanır** (kamera objeye göre değil):
+
+1. **Merkezleme:** bbox merkezi origin'e taşınır.
+2. **Bounding-sphere ölçekleme:** `radius_norm = |bbox_max − merkez|` (köşe mesafesi, gerçek
+   bounding sphere'in güvenli üst sınırı) hesaplanır; `ölçek = TARGET_RADIUS / radius_norm`
+   ile obje **sabit yarıçaplı bir küreye** (`TARGET_RADIUS = 0.5`) sığdırılır.
+   - **Neden max-bbox değil bounding-sphere?** Küre yönden bağımsızdır → obje 16 açının
+     hepsinden ve her objede AYNI açısal boyutta görünür, köşeden bakışta bile taşmaz.
+
+**Kamera mesafesi lens FOV'undan türetilir** (sabit sayı değil):
+```
+FOV = 2·atan(sensor / (2·lens)) = 2·atan(32/70) ≈ 49.2°  → yarı-FOV ≈ 24.6°
+mesafe = TARGET_RADIUS / sin(FILL_FACTOR · yarı-FOV)
+       = 0.5 / sin(0.80 · 24.6°) ≈ 1.48   (obje çerçevenin ~%80'ini doldurur)
+```
+`FILL_FACTOR = 0.80` (ayarlanabilir: yakın=daha çok detay/taşma riski, uzak=güvenli boşluk).
+`radius ≈ 1.5` bu hesabın sonucudur.
+
+### 3.1 Kamera pozisyonları
+
+Kamera sabit yarıçapta (yukarıdaki `radius ≈ 1.5`), hep origin'e bakar (`TRACK_TO` empty).
 İç parametreler: `lens = 35mm`, `sensor_width = 32mm` (orijinal Objaverse script ile aynı).
+Ölçek/mesafe sabit olsa da her görünümün **gerçek extrinsic/intrinsic'i** `meta.json`'a yazılır.
 
 Kamera pozisyonu küresel koordinattan (azimuth θ, elevation φ):
 ```
@@ -86,7 +109,8 @@ dataset/
   "uid": "001abb1a3f4c412fbd707239acb68cd6",
   "resolution": 512,
   "num_views": 16,
-  "camera": { "lens_mm": 35, "sensor_mm": 32, "radius": 1.5 },
+  "camera": { "lens_mm": 35, "sensor_mm": 32, "radius": 1.48,
+              "target_radius": 0.5, "fill_factor": 0.80 },
   "canonical_indices": [0, 1, 2, 3],
   "views": [
     {
