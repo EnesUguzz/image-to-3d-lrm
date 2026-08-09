@@ -78,15 +78,49 @@ def _mesh_bbox():
     return mn, mx
 
 
+def _world_extent(obj):
+    cs = [obj.matrix_world @ Vector(c) for c in obj.bound_box]
+    mn = Vector(min(p[i] for p in cs) for i in range(3))
+    mx = Vector(max(p[i] for p in cs) for i in range(3))
+    return mx - mn
+
+
+def remove_floor_planes():
+    """Objaverse glb'lerinde sık görülen dev zemin/plane mesh'lerini siler.
+    Sezgi: 'düz' (min boyut ~0) VE içerikten (en büyük düz-olmayan mesh) çok
+    daha büyük olan mesh bir zemindir. Tek mesh'li düz objelere dokunmaz."""
+    meshes = [o for o in bpy.context.scene.objects if o.type == "MESH"]
+    if len(meshes) < 2:
+        return
+    ext = {o: _world_extent(o) for o in meshes}
+    flat = [o for o in meshes if min(ext[o]) < 0.02 * max(max(ext[o]), 1e-9)]
+    non_flat_max = max((max(ext[o]) for o in meshes if o not in flat), default=0.0)
+    if non_flat_max <= 0:
+        return
+    for o in flat:
+        if max(ext[o]) > 2.0 * non_flat_max:
+            bpy.data.objects.remove(o, do_unlink=True)
+
+
+def _scene_root_objects():
+    return [o for o in bpy.context.scene.objects if o.parent is None]
+
+
 def normalize_scene():
+    # İki geçiş (objaverse-rendering ile aynı, hiyerarşiye dayanıklı):
+    # 1) kök objeleri ölçekle, 2) güncelle+bbox'ı yeniden ölç, 3) dünya-uzayında merkezle.
     mn, mx = _mesh_bbox()
-    center = (mn + mx) / 2.0
-    radius_norm = (mx - center).length            # köşe mesafesi (güvenli üst sınır)
+    radius_norm = (mx - mn).length / 2.0          # yarı-köşegen = bounding sphere üst sınırı
+    if radius_norm == 0:
+        return
     scale = TARGET_RADIUS / radius_norm
-    for obj in bpy.context.scene.objects:
-        if obj.parent is None:
-            obj.location = (obj.location - center) * scale
-            obj.scale = obj.scale * scale
+    for obj in _scene_root_objects():
+        obj.scale = obj.scale * scale
+    bpy.context.view_layer.update()
+    mn, mx = _mesh_bbox()
+    offset = -(mn + mx) / 2.0
+    for obj in _scene_root_objects():
+        obj.matrix_world.translation = obj.matrix_world.translation + offset
     bpy.context.view_layer.update()
 
 
@@ -99,13 +133,16 @@ def setup_lighting():
     bpy.context.scene.world.use_nodes = True
     bg = bpy.context.scene.world.node_tree.nodes.get("Background")
     if bg:
-        bg.inputs[1].default_value = 1.0    # sabit ortam ışığı
-    light_data = bpy.data.lights.new("Key", type="AREA")
-    light_data.energy = 1000
-    light_data.size = 5.0
-    light = bpy.data.objects.new("Key", light_data)
-    light.location = (0, 0, 4)
-    bpy.context.scene.collection.objects.link(light)
+        bg.inputs[1].default_value = 1.5    # sabit ortam ışığı (her yönden dengeli)
+    # Üst + alt yumuşak area ışıklar → hiçbir açı kapkaranlık kalmasın
+    for name, z in (("KeyTop", 3.0), ("FillBottom", -3.0)):
+        ld = bpy.data.lights.new(name, type="AREA")
+        ld.energy = 400
+        ld.size = 8.0
+        lo = bpy.data.objects.new(name, ld)
+        lo.location = (0, 0, z)
+        lo.rotation_euler = (0 if z > 0 else math.radians(180), 0, 0)
+        bpy.context.scene.collection.objects.link(lo)
 
 
 def setup_camera():
@@ -134,12 +171,15 @@ def main():
     setup_render(args.resolution)
     reset_scene()
     load_glb(args.object_path)
+    remove_floor_planes()
     normalize_scene()
     setup_lighting()
     cam = setup_camera()
 
     radius = cp.camera_distance(TARGET_RADIUS, LENS_MM, SENSOR_MM, FILL_FACTOR)
-    out_dir = os.path.join(args.output_dir, args.uid)
+    # Mutlak yol: Blender render.filepath'i göreli yolları .blend konumuna göre çözer;
+    # blend dosyası olmadığı için göreli yol sürücü köküne düşer. abspath bunu engeller.
+    out_dir = os.path.abspath(os.path.join(args.output_dir, args.uid))
     os.makedirs(out_dir, exist_ok=True)
     views_meta = []
     for v in cp.build_view_list(args.uid):
