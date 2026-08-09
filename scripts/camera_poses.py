@@ -32,3 +32,21 @@ def build_view_list(uid):
         views.append({"index": 4 + j, "role": "supervision",
                       "azimuth_deg": az, "elevation_deg": el})
     return views
+
+
+def camera_location(azimuth_deg, elevation_deg, radius):
+    az, el = math.radians(azimuth_deg), math.radians(elevation_deg)
+    return (radius * math.cos(el) * math.cos(az),
+            radius * math.cos(el) * math.sin(az),
+            radius * math.sin(el))
+
+
+def camera_distance(target_radius=0.5, lens_mm=35.0, sensor_mm=32.0, fill_factor=0.80):
+    half_fov = math.atan(sensor_mm / (2.0 * lens_mm))
+    return target_radius / math.sin(fill_factor * half_fov)
+
+
+def intrinsic_matrix(lens_mm=35.0, sensor_mm=32.0, resolution=512):
+    f = lens_mm / sensor_mm * resolution
+    c = resolution / 2.0
+    return [[f, 0.0, c], [0.0, f, c], [0.0, 0.0, 1.0]]
