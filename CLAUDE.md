@@ -90,6 +90,20 @@ dataset/
   area ışıklar (her açıda albedo görünür).
 - **Doğrulanan hız:** RTX 5080'de 512×512, 16 görünüm ≈ **obje başına 7–14 sn**.
 
+### Curation + log + veri stratejisi (2026-08-17)
+- **Veri stratejisi:** Önce **LVIS kürate ~3036 obje** (indirilen 50k ∩ LVIS 46k) ile eğit
+  (temiz, insan-doğrulamalı, 1.0 uid'leriyle eşleşir). Yetmezse Objaverse++ (50k) indir;
+  fallback Objaverse-XL alignment (1.3M, ama XL-keyed + yeni indirme + aylarca render).
+  Küçükle başla = pahalı render'a girmeden tüm döngüyü ucuza doğrula.
+- **Curation iki katman:** (1) `build_subset.py --curated` LVIS kesişimi (cache: `dataset/lvis_uids.json`),
+  (2) `filter_dataset.py` render sonrası **alpha kaplama + kenar-taşma** filtresi → `train_list.json` (train/val split).
+- **Robustluk (kötü kullanıcı fotosu) = input augmentation**, bozuk hedef DEĞİL. Temiz 3D hedef +
+  girdide blur/crop/jpeg/bg simülasyonu (Faz B dataloader'a not).
+- **Log sistemi:** `run_batch.py` zaman damgalı log (`dataset/renders/logs/render_*.log`) +
+  koşu sonu özeti (`render_summary.json`: done/failed/atlandı, toplam+ort süre, en yavaşlar, hata dökümü).
+- **Kodlama tuzağı:** proje yolu **Ğ** (`ENES OĞUZ`) içeriyor → tüm json okuma/yazmalarda
+  **`encoding="utf-8"`** şart (cp1254 varsayılanı çöker). Tüm scriptlerde uygulandı.
+
 ## 🛠️ Çalışma Kuralları
 
 - Yaratıcı/kurulum işine başlamadan **superpowers skill'lerini** kullan

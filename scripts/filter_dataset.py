@@ -57,10 +57,10 @@ def filter_dataset(render_dir, uids, out_path, min_cov=0.03, max_cov=0.90,
     n_val = int(len(kept_sorted) * val_frac)
     val, train = kept_sorted[:n_val], kept_sorted[n_val:]
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    with open(out_path, "w") as f:
+    with open(out_path, "w", encoding="utf-8") as f:
         json.dump({"train": sorted(train), "val": sorted(val)}, f, indent=2)
     reject_log = os.path.join(os.path.dirname(out_path) or ".", "reject_log.jsonl")
-    with open(reject_log, "w") as f:
+    with open(reject_log, "w", encoding="utf-8") as f:
         for uid, reason in rejected:
             f.write(json.dumps({"uid": uid, "reason": reason}) + "\n")
     return kept, rejected
@@ -76,7 +76,7 @@ if __name__ == "__main__":
     ap.add_argument("--max-cov", type=float, default=0.90)
     ap.add_argument("--val-frac", type=float, default=0.1)
     a = ap.parse_args()
-    with open(a.subset) as f:
+    with open(a.subset, encoding="utf-8") as f:
         uids = list(json.load(f).keys())
     kept, rejected = filter_dataset(a.render_dir, uids, a.out,
                                     a.min_cov, a.max_cov, a.val_frac)

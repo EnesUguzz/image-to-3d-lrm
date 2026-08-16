@@ -18,7 +18,7 @@ def load_curated_uids(cache_path="dataset/lvis_uids.json"):
     """LVIS kürate uid setini döndürür. Cache varsa okur; yoksa objaverse'ten
     çekip cache'ler (tek sefer indirir). objaverse yalnızca cache yokken gerekir."""
     if os.path.isfile(cache_path):
-        with open(cache_path) as f:
+        with open(cache_path, encoding="utf-8") as f:
             return set(json.load(f))
     import objaverse
     lvis = objaverse.load_lvis_annotations()
@@ -26,7 +26,7 @@ def load_curated_uids(cache_path="dataset/lvis_uids.json"):
     for v in lvis.values():
         uids.update(v)
     os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
-    with open(cache_path, "w") as f:
+    with open(cache_path, "w", encoding="utf-8") as f:
         json.dump(sorted(uids), f)
     return uids
 
@@ -42,8 +42,8 @@ def select_subset(pairs, n, seed=42, curated_uids=None):
 
 def write_subset(pairs, out_path):
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    with open(out_path, "w") as f:
-        json.dump({u: p for u, p in pairs}, f, indent=2)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump({u: p for u, p in pairs}, f, indent=2, ensure_ascii=False)
 
 
 if __name__ == "__main__":

@@ -134,6 +134,6 @@ if __name__ == "__main__":
     ap.add_argument("--resolution", type=int, default=512)
     ap.add_argument("--timeout", type=int, default=120)
     a = ap.parse_args()
-    with open(a.subset) as f:
+    with open(a.subset, encoding="utf-8") as f:
         subset = json.load(f)
     run_batch(subset, a.output_dir, a.blender, a.resolution, a.timeout)
