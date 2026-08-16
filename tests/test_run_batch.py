@@ -40,3 +40,23 @@ def test_error_category():
     assert rb._error_category("timeout>120s") == "timeout"
     assert rb._error_category("some bpy traceback") == "render_error"
     assert rb._error_category(None) is None
+
+
+def test_render_one_success(monkeypatch, tmp_path):
+    class R:
+        stdout = "blah RENDER_OK uid1 16"
+        stderr = ""
+    monkeypatch.setattr(rb.subprocess, "run", lambda *a, **k: R())
+    monkeypatch.setattr(rb, "is_done", lambda *a, **k: True)
+    rec = rb._render_one("uid1", "a.glb", str(tmp_path), "blender", 256, 60)
+    assert rec["status"] == "done" and "seconds" in rec and rec["uid"] == "uid1"
+
+
+def test_render_one_failure(monkeypatch, tmp_path):
+    class R:
+        stdout = "no ok here"
+        stderr = "bpy err"
+    monkeypatch.setattr(rb.subprocess, "run", lambda *a, **k: R())
+    monkeypatch.setattr(rb, "is_done", lambda *a, **k: False)
+    rec = rb._render_one("uid1", "a.glb", str(tmp_path), "blender", 256, 60)
+    assert rec["status"] == "failed" and rec["error"]

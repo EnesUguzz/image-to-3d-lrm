@@ -1,11 +1,13 @@
 """subset.json'u gezip her objeyi Blender ile render eder.
-Resume + timeout + manifest + zaman damgalı log + koşu sonu özeti."""
+Resume + timeout + manifest + zaman damgalı log + koşu sonu özeti + paralel worker."""
 import argparse
 import json
 import logging
 import os
 import subprocess
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 BLENDER_DEFAULT = r"C:\Program Files\Blender Foundation\Blender 4.4\blender.exe"
 
@@ -72,42 +74,64 @@ def render_command(blender, uid, glb_path, output_dir, resolution):
             "--uid", uid, "--resolution", str(resolution)]
 
 
-def run_batch(subset, output_dir, blender=BLENDER_DEFAULT, resolution=512, timeout=120):
+def _render_one(uid, glb, output_dir, blender, resolution, timeout):
+    """Tek objeyi render eder ve record döner. Sadece kendi obje klasörüne yazar
+    (paralelde thread-safe — objeler birbirinin dosyasına dokunmaz)."""
+    t0 = time.time()
+    rec = {"uid": uid, "status": "done", "error": None, "blender": "4.4",
+           "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
+    try:
+        r = subprocess.run(render_command(blender, uid, glb, output_dir, resolution),
+                           capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=timeout)
+        if "RENDER_OK" not in r.stdout or not is_done(output_dir, uid):
+            rec["status"] = "failed"
+            rec["error"] = (r.stdout + r.stderr)[-500:]
+    except subprocess.TimeoutExpired:
+        rec["status"] = "failed"
+        rec["error"] = f"timeout>{timeout}s"
+    rec["seconds"] = round(time.time() - t0, 1)
+    return rec
+
+
+def run_batch(subset, output_dir, blender=BLENDER_DEFAULT, resolution=512,
+              timeout=120, workers=1):
     os.makedirs(output_dir, exist_ok=True)
     logger = setup_logging(output_dir)
     manifest = os.path.join(output_dir, "manifest.jsonl")
     total = len(subset)
+    pending = [(uid, glb) for uid, glb in subset.items()
+               if not is_done(output_dir, uid)]
+    skipped = total - len(pending)
+    n = len(pending)
     records = []
-    skipped = 0
+    lock = threading.Lock()
+    counter = {"i": 0}
     t_start = time.time()
-    logger.info(f"koşu başladı: {total} obje, çözünürlük {resolution}, timeout {timeout}s")
-    for i, (uid, glb) in enumerate(subset.items(), 1):
-        if is_done(output_dir, uid):
-            skipped += 1
-            logger.info(f"[{i}/{total}] atla (tamam): {uid}")
-            continue
-        t0 = time.time()
-        rec = {"uid": uid, "status": "done", "error": None, "blender": "4.4",
-               "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
-        try:
-            r = subprocess.run(render_command(blender, uid, glb, output_dir, resolution),
-                               capture_output=True, text=True,
-                               encoding="utf-8", errors="replace", timeout=timeout)
-            if "RENDER_OK" not in r.stdout or not is_done(output_dir, uid):
-                rec["status"] = "failed"
-                rec["error"] = (r.stdout + r.stderr)[-500:]
-        except subprocess.TimeoutExpired:
-            rec["status"] = "failed"
-            rec["error"] = f"timeout>{timeout}s"
-        rec["seconds"] = round(time.time() - t0, 1)
-        records.append(rec)
-        with open(manifest, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        if rec["status"] == "done":
-            logger.info(f"[{i}/{total}] done: {uid} ({rec['seconds']}s)")
-        else:
-            logger.error(f"[{i}/{total}] FAILED: {uid} ({rec['seconds']}s) "
-                         f"[{_error_category(rec['error'])}] {str(rec['error'])[:200]}")
+    logger.info(f"koşu başladı: {total} obje ({skipped} zaten var), "
+                f"{n} render edilecek, {workers} worker, çözünürlük {resolution}")
+
+    def task(uid, glb):
+        rec = _render_one(uid, glb, output_dir, blender, resolution, timeout)
+        with lock:                       # sadece defter tutma serileştirilir, render değil
+            records.append(rec)
+            with open(manifest, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            counter["i"] += 1
+            i = counter["i"]
+            if rec["status"] == "done":
+                logger.info(f"[{i}/{n}] done: {uid} ({rec['seconds']}s)")
+            else:
+                logger.error(f"[{i}/{n}] FAILED: {uid} ({rec['seconds']}s) "
+                             f"[{_error_category(rec['error'])}] {str(rec['error'])[:200]}")
+
+    if workers <= 1:
+        for uid, glb in pending:
+            task(uid, glb)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for fut in [ex.submit(task, uid, glb) for uid, glb in pending]:
+                fut.result()
 
     summary = summarize(records)
     summary["skipped"] = skipped
@@ -133,7 +157,9 @@ if __name__ == "__main__":
     ap.add_argument("--blender", default=BLENDER_DEFAULT)
     ap.add_argument("--resolution", type=int, default=512)
     ap.add_argument("--timeout", type=int, default=120)
+    ap.add_argument("--workers", type=int, default=1,
+                    help="paralel Blender worker sayısı (VRAM ile sınırlı)")
     a = ap.parse_args()
     with open(a.subset, encoding="utf-8") as f:
         subset = json.load(f)
-    run_batch(subset, a.output_dir, a.blender, a.resolution, a.timeout)
+    run_batch(subset, a.output_dir, a.blender, a.resolution, a.timeout, a.workers)
