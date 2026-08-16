@@ -28,3 +28,18 @@ def test_write_subset(tmp_path):
     bs.write_subset(pairs, str(out))
     data = json.load(open(out))
     assert data == {"aaa": "/p/aaa.glb", "bbb": "/p/bbb.glb"}
+
+
+def test_select_subset_curated_filters(tmp_path):
+    pairs = bs.find_glbs(_fake_root(tmp_path))          # aaa, bbb, ccc
+    curated = {"aaa", "ccc"}
+    sel = bs.select_subset(pairs, 10, seed=42, curated_uids=curated)
+    got = {u for u, _ in sel}
+    assert got == {"aaa", "ccc"}                        # bbb elenir
+
+
+def test_load_curated_uids_reads_cache(tmp_path):
+    cache = tmp_path / "lvis_uids.json"
+    json.dump(["u1", "u2", "u3"], open(cache, "w"))
+    uids = bs.load_curated_uids(str(cache))
+    assert uids == {"u1", "u2", "u3"}

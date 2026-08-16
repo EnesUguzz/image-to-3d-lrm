@@ -14,7 +14,26 @@ def find_glbs(root):
     return out
 
 
-def select_subset(pairs, n, seed=42):
+def load_curated_uids(cache_path="dataset/lvis_uids.json"):
+    """LVIS kürate uid setini döndürür. Cache varsa okur; yoksa objaverse'ten
+    çekip cache'ler (tek sefer indirir). objaverse yalnızca cache yokken gerekir."""
+    if os.path.isfile(cache_path):
+        with open(cache_path) as f:
+            return set(json.load(f))
+    import objaverse
+    lvis = objaverse.load_lvis_annotations()
+    uids = set()
+    for v in lvis.values():
+        uids.update(v)
+    os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+    with open(cache_path, "w") as f:
+        json.dump(sorted(uids), f)
+    return uids
+
+
+def select_subset(pairs, n, seed=42, curated_uids=None):
+    if curated_uids is not None:
+        pairs = [p for p in pairs if p[0] in curated_uids]
     pairs = sorted(pairs)
     rng = random.Random(seed)
     rng.shuffle(pairs)
@@ -32,7 +51,13 @@ if __name__ == "__main__":
     ap.add_argument("--root", required=True)
     ap.add_argument("--n", type=int, default=1000)
     ap.add_argument("--out", default="dataset/subset.json")
+    ap.add_argument("--curated", action="store_true",
+                    help="Sadece LVIS kürate objeleri seç")
+    ap.add_argument("--curated-cache", default="dataset/lvis_uids.json")
     a = ap.parse_args()
-    pairs = select_subset(find_glbs(a.root), a.n)
+    curated = load_curated_uids(a.curated_cache) if a.curated else None
+    if curated is not None:
+        print(f"LVIS kürate uid: {len(curated)}")
+    pairs = select_subset(find_glbs(a.root), a.n, curated_uids=curated)
     write_subset(pairs, a.out)
     print(f"subset yazildi: {len(pairs)} obje -> {a.out}")
