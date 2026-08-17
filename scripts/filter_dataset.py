@@ -10,6 +10,7 @@ import numpy as np
 from PIL import Image
 
 CANONICAL = ["000.png", "001.png", "002.png", "003.png"]
+ALL_VIEWS = [f"{i:03d}.png" for i in range(16)]
 ALPHA_THRESH = 16  # 0-255; bunun üstü "obje" sayılır
 
 
@@ -27,19 +28,22 @@ def touches_border(png_path, border_frac=0.4):
 
 
 def passes(render_dir, uid, min_cov=0.03, max_cov=0.90):
-    """Obje eğitime uygun mu? (passed, reason) döner."""
+    """Obje eğitime uygun mu? (passed, reason) döner.
+    Coverage 16 açının hepsinde ölçülür ve MAKSİMUM alınır: obje en az bir
+    açıdan belirginse geçer (ince/düz objeler haksız elenmez). Gerçekten boş
+    obje her açıda ~0 olduğu için yine elenir."""
     d = os.path.join(render_dir, uid)
     covs = []
-    for f in CANONICAL:
+    for f in ALL_VIEWS:
         p = os.path.join(d, f)
         if not os.path.isfile(p):
             return False, f"missing:{f}"
         covs.append(alpha_coverage(p))
-    mean_cov = sum(covs) / len(covs)
-    if mean_cov < min_cov:
-        return False, f"coverage_low:{mean_cov:.3f}"
-    if mean_cov > max_cov:
-        return False, f"coverage_high:{mean_cov:.3f}"
+    max_c = max(covs)
+    if max_c < min_cov:
+        return False, f"coverage_low:{max_c:.3f}"
+    if min(covs) > max_cov:                 # en küçük açı bile taşıyorsa → sürekli kırpılma
+        return False, f"coverage_high:{min(covs):.3f}"
     if all(touches_border(os.path.join(d, f)) for f in CANONICAL):
         return False, "clipping"
     return True, "ok"
