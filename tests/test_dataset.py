@@ -9,18 +9,24 @@ from lrm.dataset import LRMDataset, lrm_collate
 
 
 def _make_obj(root, uid, n_views=16, res=64):
+    """Faz A meta.json semasini taklit eder: resolution + per-view intrinsic/file/extrinsic."""
     d = os.path.join(root, uid)
     os.makedirs(d, exist_ok=True)
-    metas = {"intrinsic": [[400, 0, 256], [0, 400, 256], [0, 0, 1]],
+    metas = {"uid": uid, "resolution": 512, "num_views": n_views,
              "canonical_indices": [0, 1, 2, 3], "views": []}
     for i in range(n_views):
         arr = np.zeros((res, res, 4), dtype=np.uint8)
         arr[16:48, 16:48, :3] = 180
         arr[16:48, 16:48, 3] = 255
-        Image.fromarray(arr, "RGBA").save(os.path.join(d, f"{i:03d}.png"))
-        c2w = np.eye(4)
-        c2w[2, 3] = 1.5  # extrinsic = world->camera
-        metas["views"].append({"extrinsic": c2w.tolist()})
+        fname = f"{i:03d}.png"
+        Image.fromarray(arr, "RGBA").save(os.path.join(d, fname))
+        ext = np.eye(4)
+        ext[2, 3] = -1.5  # world->camera: c2w kamerayi +z'ye koyar, orijine bakar
+        metas["views"].append({
+            "index": i, "role": "canonical" if i < 4 else "supervision",
+            "file": fname, "extrinsic": ext.tolist(),
+            "intrinsic": [[400, 0, 256], [0, 400, 256], [0, 0, 1]],
+        })
     with open(os.path.join(d, "meta.json"), "w", encoding="utf-8") as f:
         json.dump(metas, f)
 
