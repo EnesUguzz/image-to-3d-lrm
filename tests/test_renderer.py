@@ -14,6 +14,18 @@ def test_empty_scene_zero_alpha():
     assert acc.max() < 1e-3
 
 
+def test_partial_density_not_saturated():
+    # DUSUK sabit yogunluk => acc kismi olmali (~0.5), 1'e SATURE OLMAMALI.
+    # (son delta=1e10 hatasi burada acc'yi zorla 1 yapardi => seffaf arka plan ogrenilemez)
+    def q(pts):
+        n = pts.shape[0]
+        return torch.full((n, 1), 0.5), torch.full((n, 3), 0.5)
+    o = torch.zeros(2, 3)
+    d = torch.tensor([[0., 0., -1.]]).expand(2, 3).contiguous()
+    rgb, acc = volume_render(o, d, 0.8, 2.2, 64, q, jitter=False)
+    assert 0.3 < acc.min() and acc.max() < 0.7  # kismi opaklik, sature degil
+
+
 def test_dense_wall_high_alpha():
     # her yerde cok yuksek yogunluk, kirmizi => acc ~1, rgb ~ kirmizi
     def q(pts):

@@ -21,9 +21,10 @@ def volume_render(origins, dirs, near, far, n_samples, query_fn,
     density = density.reshape(R, n_samples)
     rgb = rgb.reshape(R, n_samples, 3)
 
+    # Sinirli obje hacmi: son delta'yi son gercek aralikla tekrarla (SONLU).
+    # 1e10 kullanmak her isini zorla opak yapar => seffaf arka plan ogrenilemez.
     delta = t[:, 1:] - t[:, :-1]
-    last = torch.full_like(delta[:, :1], 1e10)
-    delta = torch.cat([delta, last], dim=1)  # (R,S)
+    delta = torch.cat([delta, delta[:, -1:]], dim=1)  # (R,S)
 
     alpha = 1.0 - torch.exp(-density * delta)  # (R,S)
     trans = torch.cumprod(
