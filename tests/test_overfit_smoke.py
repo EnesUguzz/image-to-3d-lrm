@@ -56,6 +56,7 @@ def _tiny_dataset(tmp_path):
 
 
 def test_overfit_loss_decreases(tmp_path):
+    torch.manual_seed(0)  # model init + render jitter deterministik (suite icinde flaky olmasin)
     tl, rroot = _tiny_dataset(tmp_path)
     ds = LRMDataset(tl, rroot, split="train", input_res=224, render_res=32,
                     n_sup=2, augment=False)
