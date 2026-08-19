@@ -124,11 +124,17 @@ dataset/
   - Ayrıca renderer'da **son delta 1e10 DEĞİL sonlu** olmalı (yoksa her ışın zorla opak → şeffaf yok).
   - Overfit objesi **yüksek-kaplamalı** seçilmeli (ince obje "boş üret" tuzağına düşer).
   - Sonuç: tek obje overfit loss 1.26→0.09, preview GT'ye birebir oturdu → pipeline sağlıklı.
-- **🔑 bf16 rengi ÖLDÜRÜYOR → fp32 ŞART:** bf16 (autocast) ile sadece **geometri**
-  öğreniliyor (acc/mask iner), **renk siyahta tıkanıyor** (rgb_max~0.015, obje pikselinde bile).
-  Sebep: renk gradyanı küçük (fg-normalizasyonu), bf16'nın 8-bit mantissası yuvarlayıp
-  öldürüyor; geometri gradyanı büyük, sağ kalıyor. fp32 overfit rengi öğrenir, bf16 öğrenmez.
-  → `train_lrm.py` **varsayılanı fp32** (amp kapalı); bf16 sadece `--amp` ile (renk için kullanma).
+- **🔑🔑 RENK SİYAHA ÇÖKME → asıl neden SİYAH arka plan, çözüm BEYAZ bg:** Çok-obje
+  eğitiminde model, %85 siyah arka planı fit etmek için rgb'yi **globalce siyaha** çekiyordu
+  (obje pikselinde bile rgb~0.008; geometri/acc öğreniliyor ama renk siyah). Arka plan
+  density=0 ile de siyah olabilirdi ama erken geometri kaba → model "siyah rgb"yi koltuk
+  değneği yapıp objeyi de karartıyor. ÇÖZÜM: **beyaz arka plan** (gerçek LRM'ler böyle) —
+  `dataset.py` hedefler beyaz üzerine composite (`rgb*a + (1-a)`), `model.py white_bg=True`
+  (renderer `rgb + (1-acc)*white`). Beyazda "siyaha çek" arka planı fit etmez → renk korunur.
+  Doğrulama: obje rgb 0.008 → **0.57-0.87**.
+- **bf16 renk için riskli:** siyah-bg'de bf16 rengi öğrenmedi (fp32 öğrendi); beyaz-bg'de bf16
+  geometriyi de yavaşlattı (acc~0). → `train_lrm.py` **varsayılanı fp32** (amp kapalı),
+  bf16 sadece `--amp`. VRAM bol (fp32 ~7GB), hız 0.49 it/s.
 - **Eğitim config (doğrulandı):** render 128, micro_batch 2 × grad_accum 4 (efektif 8),
   **fp32**, grad_ckpt kapalı. VRAM ~**7GB** (bol boşluk), hız ~**0.49 it/s** (bf16'da 0.83
   ama renk yok). lr 4e-4 warmup+cosine. Model tek-obje işler; micro_batch python-loop.
