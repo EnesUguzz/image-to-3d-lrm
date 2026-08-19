@@ -16,11 +16,14 @@ model triplane NeRF üretir → mesh (`.glb`) çıkarılır → web app'te three
 
 Her faz kendi `spec → plan → implementation` döngüsüne girer (superpowers akışı).
 
-- **Faz A — Render pipeline** *(ŞU AN BURADAYIZ)*
+- **Faz A — Render pipeline** *(BİTTİ)*
   Objaverse `.glb`'lerini sabit kanonik açılardan çok-görünümlü foto + kamera pozlarına çevir.
-- **Faz B — Eğitim (asıl iş)**
-  Multi-view LRM: ViT encoder → transformer → triplane → NeRF render → görüntü/mask loss.
-  Referans mimari: OpenLRM (küçük ölçekte anlayarak uyarlanacak).
+  2927 temiz obje (2635 train + 292 val), `dataset/train_list.json`.
+- **Faz B — Eğitim (asıl iş)** *(ŞU AN BURADAYIZ — eğitim çalışıyor)*
+  Multi-view LRM: donuk DINOv2 ViT-S/14 → transformer (dim 512, 12 kat) → triplane
+  (3×64×64×32) → NeRF → volume render → fg-ağırlıklı MSE+LPIPS+mask loss.
+  Kod: `scripts/lrm/` + `scripts/train_lrm.py` + `scripts/overfit_lrm.py`.
+  Spec: `docs/superpowers/specs/2026-08-18-faz-b-lrm-egitimi-design.md`.
 - **Faz C — Web app**
   Backend: foto → inference → mesh (marching cubes) → `.glb`. Frontend: three.js viewer.
 
@@ -103,6 +106,31 @@ dataset/
   koşu sonu özeti (`render_summary.json`: done/failed/atlandı, toplam+ort süre, en yavaşlar, hata dökümü).
 - **Kodlama tuzağı:** proje yolu **Ğ** (`ENES OĞUZ`) içeriyor → tüm json okuma/yazmalarda
   **`encoding="utf-8"`** şart (cp1254 varsayılanı çöker). Tüm scriptlerde uygulandı.
+
+### Faz B — LRM eğitimi: uygulama + hata ayıklama kazanımları (2026-08-19)
+- **Ortam:** `torch 2.11.0+cu128`, RTX 5080 sm_120 doğrulandı (`scripts/check_env.py`).
+  DINOv2 (torch.hub) + LPIPS-VGG (~528MB) ilk çalıştırmada iner, sonra cache.
+- **Meta.json şeması (Faz A çıktısı):** `intrinsic` **her view içinde** (`views[i]["intrinsic"]`),
+  üstte `resolution`/`canonical_indices`; dosya adı `views[i]["file"]`. `c2w = inv(extrinsic)`
+  (extrinsic = world→camera; rotasyondaki üniform ölçek yön normalizasyonunda iptal olur).
+- **🔑 Overfit 3 kök-neden (fp32 tek-obje ile izole edildi — hepsi "loss tam donuyor" belirtisi):**
+  1. **Boş çökme:** arka plan baskın (~%78) → "boş üret" düşük loss + softplus doygunluğu
+     gradyanı öldürür. ÇÖZÜM: **fg-ağırlıklı MSE+mask** (`losses.py`, obje pikselleri ağır;
+     empty→yüksek mask cezası). Uniform mask "boş üret"i ödüllendirir, KULLANMA.
+  2. **Sisli dolgu:** `sample_triplane` `border` padding → objeyi ıskalayan ışınlar kenardan
+     density toplar. ÇÖZÜM: `model.py` query'de **bound kübü dışı density = 0** (sınırlı obje = dışı boş).
+  3. **Donuk siyah renk:** density raw noise rgb_head'i erken siyaha satüre eder. ÇÖZÜM:
+     `nerf.py` **noise_std=0** (varsayılan). density_bias=0 de yeterli.
+  - Ayrıca renderer'da **son delta 1e10 DEĞİL sonlu** olmalı (yoksa her ışın zorla opak → şeffaf yok).
+  - Overfit objesi **yüksek-kaplamalı** seçilmeli (ince obje "boş üret" tuzağına düşer).
+  - Sonuç: tek obje overfit loss 1.26→0.09, preview GT'ye birebir oturdu → pipeline sağlıklı.
+- **Eğitim config (doğrulandı):** render 128, micro_batch 2 × grad_accum 4 (efektif 8),
+  bf16, **grad_ckpt kapalı** (VRAM sadece ~4.4GB, bol boşluk), lr 4e-4 warmup+cosine.
+  Hız ~**0.83 it/s**. Model tek-obje işler; micro_batch python-loop (paralel değil).
+  Checkpoint `dataset/lrm_ckpts/last.pt` (optimizer dahil, `--resume`), val preview
+  `dataset/lrm_val_previews/val_*.png`, log `dataset/lrm_logs/`.
+- **İlk tam koşu:** 15000 adım (~45 epoch, ~5 saat), 2026-08-19 başlatıldı. Dönüşte val
+  preview'lar + loss ile kontrol; yetmezse iterasyon (boyut/lr/augmentation/veri).
 
 ## 🛠️ Çalışma Kuralları
 
