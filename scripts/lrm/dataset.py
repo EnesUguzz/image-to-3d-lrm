@@ -75,7 +75,7 @@ class LRMDataset(torch.utils.data.Dataset):
             if self.augment:
                 img = augment_input(rgba, random.Random(rng.random() * 1e9))
             else:
-                img = rgba[:3] * rgba[3:4]  # temiz: siyah bg uzerine
+                img = rgba[:3] * rgba[3:4] + (1.0 - rgba[3:4])  # temiz: BEYAZ bg
             input_imgs.append(img)
             input_c2w.append(c2w(i))
             input_K.append(K_for(i, self.input_res))
@@ -83,7 +83,8 @@ class LRMDataset(torch.utils.data.Dataset):
         sup_rgb, sup_alpha, sup_c2w, sup_K = [], [], [], []
         for i in sup_idx:
             rgba = _load_rgba(path(i), self.render_res)
-            sup_rgb.append(rgba[:3] * rgba[3:4])
+            # hedef BEYAZ bg uzerine (model white_bg render eder; rgb siyaha cokmez)
+            sup_rgb.append(rgba[:3] * rgba[3:4] + (1.0 - rgba[3:4]))
             sup_alpha.append(rgba[3:4])
             sup_c2w.append(c2w(i))
             sup_K.append(K_for(i, self.render_res))

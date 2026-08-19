@@ -13,7 +13,7 @@ from lrm.encoder import DinoEncoder
 class LRM(nn.Module):
     def __init__(self, dim=512, depth=12, heads=8, triplane_res=32,
                  triplane_ch=32, nerf_hidden=64, encoder=None,
-                 bound=0.6, near=0.8, far=2.2, n_samples=64):
+                 bound=0.6, near=0.8, far=2.2, n_samples=64, white_bg=True):
         super().__init__()
         self.encoder = encoder if encoder is not None else DinoEncoder()
         self.transformer = LRMTransformer(dim=dim, depth=depth, heads=heads,
@@ -22,6 +22,7 @@ class LRM(nn.Module):
         self.triplane_head = TriplaneHead(dim=dim, out_channels=triplane_ch)
         self.nerf = TriplaneNeRF(in_dim=3 * triplane_ch, hidden=nerf_hidden)
         self.bound, self.near, self.far, self.n_samples = bound, near, far, n_samples
+        self.white_bg = white_bg  # beyaz arka plan: rgb'nin siyaha cokme tuzagini onler
         self.patch = self.encoder.patch
 
     def make_triplane(self, input_imgs, input_c2w, input_K):
@@ -51,7 +52,8 @@ class LRM(nn.Module):
             inside = (pts.abs().amax(dim=-1, keepdim=True) <= self.bound).to(density.dtype)
             return density * inside, rgb
 
-        rgb, acc = volume_render(o, d, self.near, self.far, self.n_samples, query)
+        rgb, acc = volume_render(o, d, self.near, self.far, self.n_samples, query,
+                                 white_bg=self.white_bg)
         rgb = rgb.reshape(H, W, 3).permute(2, 0, 1)
         acc = acc.reshape(H, W, 1).permute(2, 0, 1)
         return rgb, acc
