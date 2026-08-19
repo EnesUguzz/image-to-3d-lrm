@@ -1,14 +1,19 @@
-"""LRM loss: MSE + LPIPS (algisal) + mask/alpha."""
+"""LRM loss: (foreground-agirlikli) MSE + LPIPS (algisal) + mask/alpha.
+
+Arka plan objeden cok daha genis oldugu icin ('bos uret' tuzagi) obje pikselleri
+(gt_alpha>0) fg_weight ile agirlandirilir; boylece bos sahne dusuk loss olmaz."""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
 class LRMLoss(nn.Module):
-    def __init__(self, w_mse=1.0, w_lpips=1.0, w_mask=0.5, use_lpips=True):
+    def __init__(self, w_mse=1.0, w_lpips=1.0, w_mask=1.0, use_lpips=True,
+                 fg_weight=5.0):
         super().__init__()
         self.w_mse, self.w_lpips, self.w_mask = w_mse, w_lpips, w_mask
         self.use_lpips = use_lpips
+        self.fg_weight = fg_weight
         self._lpips = None  # lazy
 
     def _lpips_fn(self, device):
@@ -21,9 +26,14 @@ class LRMLoss(nn.Module):
 
     def forward(self, pred_rgb, pred_acc, gt_rgb, gt_alpha):
         parts = {}
-        mse = F.mse_loss(pred_rgb, gt_rgb)
+        # foreground-agirlik (obje pikselleri agir): MSE'de obje renkleri
+        # 'bos uret'e cokmesin; mask'ta bos sahne cezalansin (empty->yuksek mask).
+        # Uniform mask 'bos uret'i odullendirip cokusu tetikliyordu.
+        w = 1.0 + self.fg_weight * gt_alpha            # (V,1,H,W)
+        w_rgb = w.expand_as(pred_rgb)
+        mse = (w_rgb * (pred_rgb - gt_rgb) ** 2).sum() / w_rgb.sum().clamp_min(1e-8)
         parts["mse"] = mse.detach()
-        mask = F.l1_loss(pred_acc, gt_alpha)
+        mask = (w * (pred_acc - gt_alpha).abs()).sum() / w.sum().clamp_min(1e-8)
         parts["mask"] = mask.detach()
         total = self.w_mse * mse + self.w_mask * mask
         if self.use_lpips and self.w_lpips > 0:

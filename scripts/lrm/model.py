@@ -44,7 +44,12 @@ class LRM(nn.Module):
 
         def query(pts):
             feats = sample_triplane(triplane, pts, bound=self.bound)
-            return self.nerf(feats)
+            density, rgb = self.nerf(feats)
+            # sinirli obje: bound kubu disindaki noktalar tanim geregi BOS.
+            # (aksi halde objeyi iskalayan arka plan isinlari triplane kenarindan
+            #  density toplayip 'sisli dolgu' yapiyordu -> siluet olusmuyordu.)
+            inside = (pts.abs().amax(dim=-1, keepdim=True) <= self.bound).to(density.dtype)
+            return density * inside, rgb
 
         rgb, acc = volume_render(o, d, self.near, self.far, self.n_samples, query)
         rgb = rgb.reshape(H, W, 3).permute(2, 0, 1)
