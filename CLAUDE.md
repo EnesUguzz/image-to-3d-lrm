@@ -124,13 +124,18 @@ dataset/
   - Ayrıca renderer'da **son delta 1e10 DEĞİL sonlu** olmalı (yoksa her ışın zorla opak → şeffaf yok).
   - Overfit objesi **yüksek-kaplamalı** seçilmeli (ince obje "boş üret" tuzağına düşer).
   - Sonuç: tek obje overfit loss 1.26→0.09, preview GT'ye birebir oturdu → pipeline sağlıklı.
+- **🔑 bf16 rengi ÖLDÜRÜYOR → fp32 ŞART:** bf16 (autocast) ile sadece **geometri**
+  öğreniliyor (acc/mask iner), **renk siyahta tıkanıyor** (rgb_max~0.015, obje pikselinde bile).
+  Sebep: renk gradyanı küçük (fg-normalizasyonu), bf16'nın 8-bit mantissası yuvarlayıp
+  öldürüyor; geometri gradyanı büyük, sağ kalıyor. fp32 overfit rengi öğrenir, bf16 öğrenmez.
+  → `train_lrm.py` **varsayılanı fp32** (amp kapalı); bf16 sadece `--amp` ile (renk için kullanma).
 - **Eğitim config (doğrulandı):** render 128, micro_batch 2 × grad_accum 4 (efektif 8),
-  bf16, **grad_ckpt kapalı** (VRAM sadece ~4.4GB, bol boşluk), lr 4e-4 warmup+cosine.
-  Hız ~**0.83 it/s**. Model tek-obje işler; micro_batch python-loop (paralel değil).
+  **fp32**, grad_ckpt kapalı. VRAM ~**7GB** (bol boşluk), hız ~**0.49 it/s** (bf16'da 0.83
+  ama renk yok). lr 4e-4 warmup+cosine. Model tek-obje işler; micro_batch python-loop.
   Checkpoint `dataset/lrm_ckpts/last.pt` (optimizer dahil, `--resume`), val preview
   `dataset/lrm_val_previews/val_*.png`, log `dataset/lrm_logs/`.
-- **İlk tam koşu:** 15000 adım (~45 epoch, ~5 saat), 2026-08-19 başlatıldı. Dönüşte val
-  preview'lar + loss ile kontrol; yetmezse iterasyon (boyut/lr/augmentation/veri).
+- **İlk tam koşu:** 15000 adım fp32 (~45 epoch, ~8.5 saat), 2026-08-19 başlatıldı. Dönüşte
+  val preview'lar (renk oluştu mu) + loss ile kontrol; yetmezse iterasyon (boyut/lr/veri).
 
 ## 🛠️ Çalışma Kuralları
 

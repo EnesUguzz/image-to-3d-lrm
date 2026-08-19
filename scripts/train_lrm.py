@@ -155,10 +155,13 @@ if __name__ == "__main__":
     ap.add_argument("--ckpt_every", type=int, default=2000)
     ap.add_argument("--val_every", type=int, default=1000)
     ap.add_argument("--resume", action="store_true")
-    ap.add_argument("--no_amp", action="store_true")
+    # DIKKAT: bf16 renk gradyanini olduruyor (sadece geometri ogreniliyor, renk siyah
+    # kaliyor). Bu yuzden VARSAYILAN fp32. Hiz icin bilerek bf16 istersen --amp.
+    ap.add_argument("--amp", action="store_true",
+                    help="bf16 mixed precision (DIKKAT: rengi ogrenmiyor, sadece hiz denemesi icin)")
     ap.add_argument("--grad_ckpt", action="store_true",
                     help="gradient checkpointing (VRAM darsa; varsayilan kapali)")
     a = ap.parse_args()
     train(a.train_list, a.renders_dir, a.steps, a.micro_batch, a.grad_accum,
           a.render_res, a.n_sup, a.lr, a.warmup, a.ckpt_every, a.val_every,
-          resume=a.resume, amp=not a.no_amp, grad_ckpt=a.grad_ckpt)
+          resume=a.resume, amp=a.amp, grad_ckpt=a.grad_ckpt)
