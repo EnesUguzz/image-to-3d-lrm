@@ -3,7 +3,7 @@ import torch
 
 
 def volume_render(origins, dirs, near, far, n_samples, query_fn,
-                  white_bg=False, jitter=None):
+                  white_bg=False, jitter=None, bg_color=None):
     device = origins.device
     R = origins.shape[0]
     t = torch.linspace(near, far, n_samples, device=device)  # (S,)
@@ -34,6 +34,10 @@ def volume_render(origins, dirs, near, far, n_samples, query_fn,
 
     rgb_out = (weights[..., None] * rgb).sum(dim=1)  # (R,3)
     acc = weights.sum(dim=1, keepdim=True)           # (R,1)
-    if white_bg:
+    # bg_color: her adim rastgele renk => model sabit ciktiyla arka plani
+    # tutturamaz, objeyi (renk+opaklik) gercekten kurmak zorunda kalir.
+    if bg_color is not None:
+        rgb_out = rgb_out + (1.0 - acc) * bg_color
+    elif white_bg:
         rgb_out = rgb_out + (1.0 - acc)
     return rgb_out, acc

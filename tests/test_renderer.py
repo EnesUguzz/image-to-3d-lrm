@@ -26,6 +26,33 @@ def test_partial_density_not_saturated():
     assert 0.3 < acc.min() and acc.max() < 0.7  # kismi opaklik, sature degil
 
 
+def test_bg_color_composites_empty_scene():
+    # bos sahne (yogunluk 0) => render TAM OLARAK bg_color olmali.
+    # (random-bg egitim fix'i: model bg rengini dogru kompozitlemeli)
+    def q(pts):
+        n = pts.shape[0]
+        return torch.zeros(n, 1), torch.zeros(n, 3)
+    o = torch.zeros(2, 3)
+    d = torch.tensor([[0., 0., -1.]]).expand(2, 3).contiguous()
+    c = torch.tensor([0.2, 0.7, 0.4])
+    rgb, acc = volume_render(o, d, 0.5, 2.0, 16, q, bg_color=c)
+    assert torch.allclose(rgb, c.expand(2, 3), atol=1e-3)
+
+
+def test_bg_color_changes_output_partial_scene():
+    # yari-saydam sahne: farkli bg rengi => farkli render (sabit cikti olamaz).
+    def q(pts):
+        n = pts.shape[0]
+        return torch.full((n, 1), 0.5), torch.full((n, 3), 0.5)
+    o = torch.zeros(2, 3)
+    d = torch.tensor([[0., 0., -1.]]).expand(2, 3).contiguous()
+    r1, _ = volume_render(o, d, 0.8, 2.2, 64, q, jitter=False,
+                          bg_color=torch.tensor([1., 0., 0.]))
+    r2, _ = volume_render(o, d, 0.8, 2.2, 64, q, jitter=False,
+                          bg_color=torch.tensor([0., 0., 1.]))
+    assert (r1 - r2).abs().max() > 0.1  # bg farki cikisa yansimali
+
+
 def test_dense_wall_high_alpha():
     # her yerde cok yuksek yogunluk, kirmizi => acc ~1, rgb ~ kirmizi
     def q(pts):

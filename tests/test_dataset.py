@@ -52,7 +52,11 @@ def test_item_shapes_and_input_count_in_range(tmp_path):
     assert item["input_imgs"].shape[1:] == (3, 224, 224)
     assert item["input_c2w"].shape == (k, 4, 4)
     assert item["sup_rgb"].shape == (4, 3, 128, 128)
+    assert item["sup_premult"].shape == (4, 3, 128, 128)
     assert item["sup_alpha"].shape == (4, 1, 128, 128)
+    # premult + (1-alpha)*beyaz == beyaz-kompozit sup_rgb (random-bg egitim tutarliligi)
+    recon = item["sup_premult"] + (1.0 - item["sup_alpha"])
+    assert torch.allclose(recon, item["sup_rgb"], atol=1e-5)
 
 
 def test_supervision_disjoint_from_input(tmp_path):
@@ -67,3 +71,24 @@ def test_collate_returns_list(tmp_path):
     ds = LRMDataset(tl, rroot, split="train")
     batch = lrm_collate([ds[0], ds[1]])
     assert isinstance(batch, list) and len(batch) == 2
+
+
+def test_egitimde_her_epoch_farkli_gorunum_ve_augment(tmp_path):
+    """Regresyon: seed idx'e sabitlenince her epoch ayni girdi/sup gorunumu ve
+    ayni augmentation ciktisi geliyordu (16 render'in 12'si olu, augment sahte)."""
+    tl, rroot = _setup(tmp_path)
+    ds = LRMDataset(tl, rroot, split="train", render_res=32, augment=True)
+    assert ds.deterministic is False
+    goruldu = {tuple(ds[0]["sup_view_idx"]) for _ in range(12)}
+    assert len(goruldu) > 1, "supervision gorunumleri epoch'lar arasi degismiyor"
+    imgs = [ds[0]["input_imgs"] for _ in range(6)]
+    assert any((imgs[0].shape != i.shape) or (imgs[0] - i).abs().mean() > 1e-6
+               for i in imgs[1:]), "augmentation rastgele degil"
+
+
+def test_val_deterministik_kalir(tmp_path):
+    """Onizleme/val kararli olsun: augment kapaliyken ayni idx ayni ornegi verir."""
+    tl, rroot = _setup(tmp_path)
+    ds = LRMDataset(tl, rroot, split="train", render_res=32, augment=False)
+    assert ds.deterministic is True
+    assert ds[0]["sup_view_idx"] == ds[0]["sup_view_idx"]

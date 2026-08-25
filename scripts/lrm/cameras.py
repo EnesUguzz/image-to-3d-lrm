@@ -37,3 +37,18 @@ def plucker_map(c2w, K, H, W):
     m = torch.cross(o, d, dim=-1)
     pl = torch.cat([d, m], dim=-1)
     return pl.reshape(H, W, 6)
+
+
+def canonicalize(ref_c2w, c2w_stack):
+    """Kamera normalizasyonu (LRM): dunyayi, referans (giris) kamerasi kanonik
+    poza (+Z ekseninde, orijine bakan, identity rotasyon) gelecek sekilde dondurur;
+    AYNI donusumu tum kameralara uygular => obje her ornekte ayni yonelimden gorunur,
+    optimizasyon uzayi daralir (LRM'de PSNR 15.3->19.0). Saf rotasyon oldugu icin obje
+    orijinde kalir. c2w_stack: (V,4,4). Donus: (V,4,4)."""
+    R = ref_c2w[:3, :3].transpose(-1, -2)          # kanonik = identity => R = R_ref^T
+    rot = c2w_stack[:, :3, :3]
+    trn = c2w_stack[:, :3, 3]
+    out = c2w_stack.clone()
+    out[:, :3, :3] = torch.einsum("ij,vjk->vik", R, rot)
+    out[:, :3, 3] = torch.einsum("ij,vj->vi", R, trn)
+    return out
