@@ -10,6 +10,11 @@ import numpy as np
 from PIL import Image
 
 CANONICAL = ["000.png", "001.png", "002.png", "003.png"]
+# min_cov 0.03 -> 0.010 (2026-08-24): 0.03 esigi eski "sphere" cerceveleme
+# icin ayarlanmisti. Yeni "fit" modunda ince/uzun objeler (kilic, yay,
+# merdiven, ayakta insan) en kotu izdusumleri kareye oturtuldugu icin diger
+# acilardan cizgiye iniyor; 0.03 bunlarin 661 tanesini HAKSIZ eliyordu.
+# Gozle dogrulandi: <0.010 gercek coplerin bandi, >=0.010 saglam ince obje.
 ALL_VIEWS = [f"{i:03d}.png" for i in range(16)]
 ALPHA_THRESH = 16  # 0-255; bunun üstü "obje" sayılır
 
@@ -27,7 +32,7 @@ def touches_border(png_path, border_frac=0.4):
     return bool(edges.mean() > border_frac)
 
 
-def passes(render_dir, uid, min_cov=0.03, max_cov=0.90):
+def passes(render_dir, uid, min_cov=0.010, max_cov=0.90):
     """Obje eğitime uygun mu? (passed, reason) döner.
     Coverage 16 açının hepsinde ölçülür ve MAKSİMUM alınır: obje en az bir
     açıdan belirginse geçer (ince/düz objeler haksız elenmez). Gerçekten boş
@@ -49,7 +54,7 @@ def passes(render_dir, uid, min_cov=0.03, max_cov=0.90):
     return True, "ok"
 
 
-def filter_dataset(render_dir, uids, out_path, min_cov=0.03, max_cov=0.90,
+def filter_dataset(render_dir, uids, out_path, min_cov=0.010, max_cov=0.90,
                    val_frac=0.1, seed=42):
     kept, rejected = [], []
     for uid in uids:
@@ -76,7 +81,7 @@ if __name__ == "__main__":
     ap.add_argument("--subset", default="dataset/subset.json",
                     help="uid listesi (subset.json ya da meta içeren dizin)")
     ap.add_argument("--out", default="dataset/train_list.json")
-    ap.add_argument("--min-cov", type=float, default=0.03)
+    ap.add_argument("--min-cov", type=float, default=0.010)
     ap.add_argument("--max-cov", type=float, default=0.90)
     ap.add_argument("--val-frac", type=float, default=0.1)
     a = ap.parse_args()

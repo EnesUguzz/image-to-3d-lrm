@@ -60,7 +60,15 @@ def summarize(records):
     }
 
 
-def is_done(output_dir, uid, num_views=16):
+def _expected_views():
+    """Beklenen gorunum sayisi SEMADAN gelir; sabit 16 varsayarsak sphere20 (24)
+    kosusunda yarim render edilmis objeler "tamam" sayilirdi."""
+    import camera_poses
+    return len(camera_poses.build_view_list("_probe_"))
+
+
+def is_done(output_dir, uid, num_views=None):
+    num_views = _expected_views() if num_views is None else num_views
     d = os.path.join(output_dir, uid)
     if not os.path.isfile(os.path.join(d, "meta.json")):
         return False

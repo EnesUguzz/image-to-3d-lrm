@@ -33,13 +33,13 @@ def test_touches_border_true_when_full(tmp_path):
 
 def test_score_object_low_coverage_rejected(tmp_path):
     root = _obj(tmp_path, "tiny", coverage_pixels=16, size=64)  # ~0.4% doluluk
-    passed, reason = fd.passes(root, "tiny", min_cov=0.03, max_cov=0.90)
+    passed, reason = fd.passes(root, "tiny", min_cov=0.010, max_cov=0.90)
     assert passed is False and "coverage" in reason
 
 
 def test_score_object_good_passes(tmp_path):
     root = _obj(tmp_path, "good", coverage_pixels=1600, size=64)  # ~39% doluluk
-    passed, reason = fd.passes(root, "good", min_cov=0.03, max_cov=0.90)
+    passed, reason = fd.passes(root, "good", min_cov=0.010, max_cov=0.90)
     assert passed is True and reason == "ok"
 
 
@@ -56,7 +56,7 @@ def test_thin_object_passes_if_big_from_some_view(tmp_path):
         Image.fromarray(arr, "RGBA").save(d / f"{i:03d}.png")
     import json as _j
     _j.dump({"uid": "thin", "num_views": 16}, open(d / "meta.json", "w"))
-    passed, reason = fd.passes(str(tmp_path), "thin", min_cov=0.03, max_cov=0.90)
+    passed, reason = fd.passes(str(tmp_path), "thin", min_cov=0.010, max_cov=0.90)
     assert passed is True and reason == "ok"
 
 
@@ -65,7 +65,7 @@ def test_filter_dataset_splits(tmp_path):
     _obj(tmp_path, "tiny", coverage_pixels=16, size=64)
     out = tmp_path / "train_list.json"
     kept, rejected = fd.filter_dataset(root, ["good", "tiny"], str(out),
-                                       min_cov=0.03, max_cov=0.90, val_frac=0.0)
+                                       min_cov=0.010, max_cov=0.90, val_frac=0.0)
     assert kept == ["good"] and "tiny" in dict(rejected)
     data = json.load(open(out))
     assert data["train"] == ["good"]
