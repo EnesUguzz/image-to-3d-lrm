@@ -236,9 +236,19 @@ belirliyor. `sphere20` şeması kodda var (`RENDER_VIEW_SCHEME=sphere20`, 24 gö
 | `M_encall` | `--train_encoder` | 16.93 | %12 | 1.013 |
 
 → **ön-plana yanlı kırpma** ve **büyük batch** işe yarıyor.
-→ `M_enc4`, `M_base` ile bit-bazında aynı (çıktı PNG md5'i bile aynı) — encoder
-açılmış görünüyor (39.6M→46.7M) ve mekanizma izole testte çalışıyor (gradyan akıyor),
-o koşuda neden etkisiz kaldığı **bulunamadı**. **Kısmi encoder çözme CEVAPSIZ.**
+
+**⛔ DÜZELTME (2026-08-26): bu matris GEÇERSİZ.** `M_base` ve `M_enc4`'ün ikisi de
+yoğunluğu sıfıra çökertip **tamamen beyaz** çıktı üretmiş (`pred_min=1.000`,
+`pred_mean=1.0000`, objeler arası std `0.0000`; PSNR 500/1000/1500/1999. adımlarda
+birebir 17.80 dB'de donmuş). `acc→0` ⇒ renderer `bg_color`'ı aynen basar; softplus
+gradyanı öldüğü için encoder'ı açmak da açmamak da bir şey değiştiremez —
+"bit-bazında aynı" tespiti de yanlıştı (loss 5. ondalıkta farklı: 0.5465 / 0.54651).
+Yani `M_base` bir *taban tarife* değil bir *çöküş*; `oran=1.000` referansına göre
+yapılan tüm sıralama çöp. Aynı tarife farklı 32-obje kümesiyle (`AB_YENI`) çökmedi
+(20.11 dB / %75) → çöküş hem tarifeye hem alt kümeye bağlı.
+**Kısmi encoder çözme hâlâ CEVAPSIZ ama sebebi artık biliniyor.**
+`TriplaneNeRF`'in `density_bias` / `noise_std` çengelleri tam bu çöküşün panzehiri
+ama `LRM.__init__` hiç bağlamıyor (daima 0.0) — bağlanmalı.
 
 **İlk tam-veri genelleme eğrisi** (13k obje, 16.000 adım, taban tarife — BİTTİ):
 ```
@@ -273,16 +283,110 @@ için metrik objeler arası karşılaştırılabilir. Çıktı: `psnr`, `top1` (
 4. **32-obje sonucu ölçeğe transfer etmeyebilir** — öğretmen numarası 32'de %100, 2635'te kırıldı.
 5. **Eski çıktılar klasörlerde duruyor** (`lrm_val_previews/`, `lrm_bench/`). Dosya tarihine bak.
 
-### Açık işler (öncelik sırasıyla)
+### 📋 Açık işler → **`docs/egitim-oncesi-hazirlik-plani.md`** (2026-08-26)
 
-1. Kısmi encoder çözmeyi **ağırlık-değişti kontrolüyle** yeniden koş (`M_enc4` geçersizdi)
-2. `train_lrm.py`'ye **crop desteği** ekle (matrisin kazananıydı, aktarılamadı —
-   `overnight.sh` seçicisi aktarılamayan bayrak kazanınca sessizce "(yok)" yazıyor, düzelt)
-3. Efektif batch'i büyüt (şu an micro 2 × accum 4 = 8)
-4. Encoder için **ayrı düşük LR** (şu an encoder de 4e-4 alıyor)
-5. Üst/alt fotoyu **girdi** vermek conditioning'i düzeltir mi (sphere20 render'ları `dataset/_viewcov/` hazır)
-6. `normalize_cams` A/B (şu an kapalı)
-7. 50k'ya çıkma — 13k'da genelleme görülmeden anlamsız
+Tam plan, ön-kayıtlı kapılar, senaryolar ve GO/NO-GO listesi orada. Özet:
+
+- **Kök neden netleşti:** tarifemiz OpenLRM'in kendi `train-sample.yaml`'ından
+  **5 noktada** sapıyor ve beşi de aleyhimize: encoder DONUK (referans açık),
+  denetim tam kare (referans **64² bölge kırpma**), fp32 (referans bf16),
+  `normalize_camera` kapalı (referans açık), warmup 500 (referans 3000).
+  Üstüne biz **~10 epoch** yaptık, referans **60**. Mimari aynı (dim 512, 12 kat,
+  triplane 32→64×32, DINOv2 ViT-S/14) → mimari tartışması kapandı.
+- **Hız: ölçülmüş 3,0× hazır** — 192,3 → 63,5 ms/obje (bf16 1,79× + 3 görünüm × 64²).
+  Elenenler: `torch.compile` (%2), obje-batch'leme (fayda yok), ışın-AABB (küçük).
+  Veri yükleme senkron 28,5 ms/obje → worker'lı `DataLoader` şart.
+- **Veri tavanı:** diskte temiz score≥2 = **24.571** obje (score-2'nin 9.977'si
+  henüz render edilmedi, ~1,8 sa). 50k için **~25,5k yeni indirme (~245 GB)**.
+- **Strateji:** referans tarifeyi ablasyonsuz benimse; deney bütçesini sadece
+  bize özgü sorulara harca (LPIPS ağırlığı, mask loss biçimi, `density_bias`,
+  girdi çözünürlüğü, `bound`, kırpma tipi).
+- **İlk iş — KARAR KAPISI:** `fit_teacher` (1024 obje, YENİ render setinde) →
+  `distill_lrm` **tam program** (24k adım). `train_rel < 0.25` ise sorun tarife,
+  `≥ 0.50` ise kapasite. Önceki "0,71'de takıldı" sonucu **%27'de kesilmiş** koşudan.
+- **Eğitimden ÖNCE yapılmamış olanlar:** mesh çıkarma doğrulaması (oracle triplane
+  üzerinde), tam veri denetim raporu, dokunulmamış test seti, resume testi,
+  gerçek foto değerlendirme seti, `bound` kalibrasyonu.
+
+#### Blok 0 BİTTİ (2026-08-26) — yeni araçlar ve zorunlu alışkanlıklar
+
+- `scripts/lrm/guards.py` — **çöküş dedektörü**. `bench_overfit.py` ve
+  `train_lrm.py`'ye bağlı; her değerlendirmede `acc` + objeler arası piksel std
+  loglanıyor. Eşik **0,010** (çökmüş koşular 0,0000–0,0001; sağlamlar 0,038–0,088).
+  Dejenere koşu `<<< SIRALAMAYA SOKMA` uyarısı basar — **sıralamaya sokma.**
+  Eğitilmemiş model tanımı gereği `MEAN_COLLAPSE`'tadır; sesli alarm
+  `2 × warmup` sonrası çalar (`--collapse_after`).
+- `scripts/lrm/runstamp.py` — koşu künyesi (`git_sha`, argv, torch, GPU, config
+  hash) + **ağırlık-değişti kontrolü**. Bir bayrağın "açıldığını" iddia eden her
+  koşu artık ağırlıkların gerçekten değiştiğini kanıtlıyor.
+  *(Doğrulandı: `--unfreeze_last 2` → 30/30 encoder tensörü değişiyor. Yani
+  `M_enc4` gizemi tamamen kapandı: gradyan akıyordu, koşu beyaz çöküşteydi.)*
+- `scripts/lrm/defaults.py` — `N_SAMPLES`/`BOUND`/`NEAR`/`FAR` **tek kaynak**.
+  `fit_teacher.py` near/far'ı elle yazıyordu (öğretmen–öğrenci sessizce ayrışabilirdi).
+- `dataset/bench_uids_{32,250,1024}.json` — **sabit, iç içe** (32⊂250⊂1024) tezgâh
+  kümeleri, artık repoda (`.gitignore`'da istisna var). **A/B kollarını daima
+  `--uids_file` ile sabitle**, `--n_obj` ile listeden adımlama.
+- `scripts/bench_speed.py` — hız tezgâhı. Ölçülen: taban 196,7 ms/obje (5,1 obje/s)
+  → hedef (bf16 + 3 görünüm × 64²) **69,0 ms/obje (14,5 obje/s), VRAM 2,72 GB**.
+  `n_samples` 48→96 sadece %8 maliyetli.
+
+- **⛔ `dataset/lrm_ckpts/last.pt` (16.000 adım) KAYBEDİLDİ.** 40 adımlık bir duman
+  testi ezdi: `train()` sonunda `save_checkpoint` **koşulsuz** çağrılıyordu.
+  Val eğrisi (`val_metrics.jsonl`) ve önizlemeler duruyor. Tuzak kapatıldı —
+  `save_checkpoint` artık küçük adımlı kaydı büyük adımlının üzerine `force=True`
+  olmadan yazmıyor, 3 regresyon testi var. Duman testi checkpoint'i
+  `dataset/lrm_ckpts/SMOKE_step40_KULLANMA.pt` olarak kenara alındı
+  (`--resume` sessizce yüklemesin).
+- Testler: **101 geçiyor** (önce 63).
+
+#### Blok 1 BİTTİ (2026-08-26) — hız 2,8× + iki kök bulgu
+
+**Hız (uçtan uca, gerçek eğitim döngüsü):** 5,06 → **14,2 obje/s**.
+Değişenler: worker'lı `DataLoader` (6), bf16 (kayıp daima fp32'de),
+**bölge kırpma**, `n_sup` 3, coarse-to-fine kapalı. VRAM 7,25 → 2,8 GB.
+
+- `scripts/lrm/crop.py` — OpenLRM/TripoSR bölge kırpma. Supervision hedefi
+  `U[64,192]` çözünürlükte render'dan kırpılan **64² ön-plana yanlı yama**.
+  Işın bütçesi sabit, yamadaki obje oranı çok yüksek. **9 test**, en kritiği
+  ışın denkliği (kırpılmış `(i,j)` = tam karedeki `(i+ax, j+ay)`).
+- **Coarse-to-fine KALDIRILDI** (`--coarse_frac 0`, bayrak A/B için duruyor).
+  Ölçüldü: 1,25× hız (koşunun %11'i) veriyordu ama geçişte mask kaybını 2×
+  sıçratıyor (540 adım toparlanma) ve kaba fazın 8000 adımında top-1 hiç
+  şanstan yukarı çıkmamıştı. 8500'deki 3 dB "sıçrama" **ölçüm artefaktıydı**
+  (val hep 128'de ölçülüyor, model 64'te eğitiliyordu) — top-1 o an kıpırdamadı.
+
+**🔑 K2 çözüldü — "bf16 rengi öldürüyor" YANLIŞ TEŞHİSTİ.**
+Sabit 32 uid, aynı seed, 2000 adım (`bench_uids_32`):
+
+| kol | PSNR | top-1 | oran | not |
+|---|---|---|---|---|
+| fp32 | 17,82 | %31 | 0,876 | sağlıklı |
+| bf16 | 15,52 | %3 | 1,244 | **1500 adım `acc=0.0000` çöküşünde** |
+| **bf16 + `density_bias 1.0`** | **18,42** | **%41** | **0,823** | hiç çökmedi |
+
+Renderer izole test edildi: bf16'da bağıl hata **0,0003** — sayısal sorun YOK.
+Gerçek mekanizma: **tarife bıçak sırtı.** `acc→0` olunca softplus gradyanı ölür
+ve model soğurucu durumdan çıkamaz. Aynı çöküş üç kez ısırdı: `M_base`,
+`M_enc4`, `K2_bf16`.
+**Panzehir `density_bias`** — `nerf.py`'de yazılıydı ama `LRM.__init__` hiç
+bağlamıyordu (K4). Bağlandı (`--density_bias`, `--noise_std`), 4 test eklendi.
+
+#### Veri: denetim + nihai split (2026-08-26)
+
+- `scripts/audit_dataset.py` — **14.454 obje × 16 görünüm** tarandı.
+  Eksik/bozuk meta, bozuk PNG, boş render, kamera/intrinsic tutarsızlığı,
+  **kenar taşması: hepsi 0**. Sorunlu: 79 (%0,55 — 62 tek renk, 18 karanlık).
+- **`bound` kalibre edildi (E8):** obje yarıçapı medyan 0,453 / p99 0,512 /
+  **maks 0,540** ⇒ `bound` **0,6 → 0,552**, aynı ızgarada **1,28× etkin
+  hacim yoğunluğu**.
+- **⛔ "Kopya" bulgusu YANLIŞ POZİTİFTİ.** Tek-görünüm (kanonik[0]) imzası düz
+  objelerde yanılıyor: plastik kılıflı koleksiyon kartları ön/arka açıdan
+  kenardan görünüp ince çizgiye iniyor. **4 kanonik açıyla: 0 kopya, 0 sızıntı.**
+  → Bu veri setinde tek görünüme dayanan imza kullanma.
+- Gerçek sorun: **girdi görünümü boş 134 obje (%0,93)** — elendi.
+- `scripts/build_split.py` → **`dataset/train_list_v2.json`**:
+  **train 12.320 / val 1.424 / test 500**. 210 obje elendi. Küme bölünmesi 0.
+  **Test seti hiçbir tarife kararında kullanılmaz** (E4).
 
 ### Eğitim öncesi netleştirme (2026-08-24 gecesi)
 

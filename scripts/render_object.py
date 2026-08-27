@@ -297,7 +297,7 @@ def main():
             "canonical_indices": [v["index"] for v in views_meta
                                   if v.get("role") == "canonical"] or [0, 1, 2, 3],
             "views": views_meta}
-    with open(os.path.join(out_dir, "meta.json"), "w") as f:
+    with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
     print("RENDER_OK", args.uid, len(views_meta))
 

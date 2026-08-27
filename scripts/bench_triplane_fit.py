@@ -124,7 +124,7 @@ def main():
             imgs.append(torch.cat([d["prem"][0] + (1 - d["alpha"][0]), rgb[0]], -1))
         Image.fromarray((torch.cat(imgs, 1).clamp(0, 1).permute(1, 2, 0).cpu().numpy()
                          * 255).astype(np.uint8)).save(f"{OUT}/{a.tag}.png")
-    json.dump(dict(cfg=vars(a), hist=hist), open(f"{OUT}/{a.tag}.json", "w"), indent=1)
+    json.dump(dict(cfg=vars(a), hist=hist), open(f"{OUT}/{a.tag}.json", "w", encoding="utf-8"), indent=1)
     if a.save_tp:
         torch.save({"triplanes": triplanes.detach().cpu(), "nerf": nerf.state_dict(),
                     "uids": uids, "cfg": vars(a)}, f"{OUT}/{a.tag}_tp.pt")

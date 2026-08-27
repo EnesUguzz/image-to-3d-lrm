@@ -110,7 +110,7 @@ def main():
             hist.append(dict(step=step, train_rel=agg, eval_rel=rel, psnr=psnr))
             print(f"  step {step:5d} triplane_rel_mse={agg:.4f} eval_rel={rel:.4f} "
                   f"renderPSNR={psnr:.2f}dB [{(step+1)/(time.time()-t0):.2f} it/s]", flush=True)
-    json.dump(dict(cfg=vars(a), hist=hist), open(f"{OUT}/{a.tag}.json", "w"), indent=1)
+    json.dump(dict(cfg=vars(a), hist=hist), open(f"{OUT}/{a.tag}.json", "w", encoding="utf-8"), indent=1)
     if a.save_model:
         torch.save({"model": model.state_dict(), "arch": a.arch, "uids": uids},
                    f"{OUT}/{a.tag}_model.pt")

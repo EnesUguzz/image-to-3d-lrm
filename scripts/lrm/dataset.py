@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from lrm import cameras
+from lrm import crop as cropmod
 from lrm.augment import augment_input
 
 RENDER_MASTER_RES = 512  # meta intrinsic bu cozunurluge gore
@@ -28,7 +29,8 @@ class LRMDataset(torch.utils.data.Dataset):
     def __init__(self, train_list_path, renders_dir, split="train",
                  input_res=224, render_res=128, n_sup=4, augment=True, seed=0,
                  normalize_cams=False, deterministic=None, max_input=None,
-                 force_n_input=0):
+                 force_n_input=0, region=0, render_low=64, render_high=192,
+                 fg_bias=0.75):
         with open(train_list_path, encoding="utf-8") as f:
             self.uids = json.load(f)[split]
         self.renders_dir = renders_dir
@@ -54,6 +56,14 @@ class LRMDataset(torch.utils.data.Dataset):
         # force_n_input>0: k'yi sabitler. Val metriginde sart -- yoksa her objenin
         # girdi sayisi farkli olur ve "tek fotodan rekonstruksiyon" olcumu karisir.
         self.force_n_input = force_n_input
+        # BOLGE KIRPMA (OpenLRM/TripoSR). region>0 ise supervision hedefi, U[low,high]
+        # cozunurlukte render edilmis kareden kirpilan region x region bir yamadir.
+        # Isin butcesi region^2'de SABIT kalir ama yamadaki obje orani cok yukselir
+        # (objelerimiz tam karenin sadece ~%9'unu kapliyor). Bkz. lrm/crop.py.
+        self.region = region
+        self.render_low = render_low
+        self.render_high = render_high
+        self.fg_bias = fg_bias
 
     def __len__(self):
         return len(self.uids)
@@ -104,7 +114,20 @@ class LRMDataset(torch.utils.data.Dataset):
 
         sup_rgb, sup_premult, sup_alpha, sup_c2w, sup_K = [], [], [], [], []
         for i in sup_idx:
-            rgba = _load_rgba(path(i), self.render_res)
+            if self.region:
+                # her gorunum kendi cozunurlugunu ve kendi capasini alir (OpenLRM)
+                r = cropmod.sample_render_res(rng, self.render_low,
+                                              self.render_high, self.region)
+                rgba = _load_rgba(path(i), r)
+                ax, ay = cropmod.sample_anchor(rgba[3:4], r, self.region, rng,
+                                               self.fg_bias)
+                rgba = cropmod.crop_image(rgba, ax, ay, self.region)
+                K = cropmod.scale_and_crop_K(
+                    torch.tensor(views[i]["intrinsic"], dtype=torch.float32),
+                    master_res, r, ax, ay)
+            else:
+                rgba = _load_rgba(path(i), self.render_res)
+                K = K_for(i, self.render_res)
             # premultiplied obje rengi (obj*alpha): egitimde her adim RASTGELE bg
             # rengine kompozitlenir => model sabit ciktiyla arka plani tutturamaz,
             # objeyi gercekten kurar (sabit-bg 'renk cokmesi' tuzagini kapatir).
@@ -113,7 +136,7 @@ class LRMDataset(torch.utils.data.Dataset):
             sup_rgb.append(rgba[:3] * rgba[3:4] + (1.0 - rgba[3:4]))
             sup_alpha.append(rgba[3:4])
             sup_c2w.append(c2w(i))
-            sup_K.append(K_for(i, self.render_res))
+            sup_K.append(K)
 
         in_c2w = torch.stack(input_c2w)
         su_c2w = torch.stack(sup_c2w)
@@ -125,6 +148,7 @@ class LRMDataset(torch.utils.data.Dataset):
 
         return {
             "uid": uid,
+            "idx": idx,
             "input_imgs": torch.stack(input_imgs),
             "input_c2w": in_c2w,
             "input_K": torch.stack(input_K),
@@ -135,6 +159,7 @@ class LRMDataset(torch.utils.data.Dataset):
             "sup_c2w": su_c2w,
             "sup_K": torch.stack(sup_K),
             "sup_view_idx": sup_idx,
+            "sup_res": self.region or self.render_res,
         }
 
 

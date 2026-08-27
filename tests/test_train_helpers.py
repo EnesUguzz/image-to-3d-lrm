@@ -55,3 +55,39 @@ def test_checkpoint_ogretmeni_de_saklar(tmp_path):
     assert t2 is not None and t2.shape == teacher.shape
     assert torch.allclose(t2, teacher.detach().cpu())
     assert ot2 is not None
+
+
+def test_kisa_kosu_uzun_kosunun_checkpointini_EZEMEZ(tmp_path):
+    """GERCEKTEN OLDU (2026-08-26): 40 adimlik bir duman testi, kosu sonunda
+    kosulsuz save_checkpoint cagirdigi icin 16.000 adimlik gece kosusunun
+    last.pt'sini ezdi. Artik daha KUCUK adimli bir kayit, daha buyuk adimli
+    mevcut bir kaydin uzerine force olmadan yazamaz."""
+    m = _tiny_model()
+    opt = torch.optim.AdamW(m.parameters(), lr=1e-3)
+    sched = torch.optim.lr_scheduler.ConstantLR(opt)
+    p = str(tmp_path / "last.pt")
+
+    save_checkpoint(p, m, opt, sched, step=16000)
+    written = save_checkpoint(p, m, opt, sched, step=40)      # duman testi
+    assert written is False
+    assert torch.load(p, map_location="cpu", weights_only=False)["step"] == 16000
+
+
+def test_ilerleyen_kosu_kendi_checkpointini_yazabilir(tmp_path):
+    m = _tiny_model()
+    opt = torch.optim.AdamW(m.parameters(), lr=1e-3)
+    sched = torch.optim.lr_scheduler.ConstantLR(opt)
+    p = str(tmp_path / "last.pt")
+    save_checkpoint(p, m, opt, sched, step=1000)
+    assert save_checkpoint(p, m, opt, sched, step=2000) is True
+    assert torch.load(p, map_location="cpu", weights_only=False)["step"] == 2000
+
+
+def test_force_ile_bilerek_ezilebilir(tmp_path):
+    m = _tiny_model()
+    opt = torch.optim.AdamW(m.parameters(), lr=1e-3)
+    sched = torch.optim.lr_scheduler.ConstantLR(opt)
+    p = str(tmp_path / "last.pt")
+    save_checkpoint(p, m, opt, sched, step=16000)
+    assert save_checkpoint(p, m, opt, sched, step=40, force=True) is True
+    assert torch.load(p, map_location="cpu", weights_only=False)["step"] == 40

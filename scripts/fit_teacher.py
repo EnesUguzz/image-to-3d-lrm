@@ -17,8 +17,9 @@ from PIL import Image
 sys.path.insert(0, os.path.dirname(__file__))
 from lrm import cameras
 from lrm.dataset import LRMDataset
+from lrm import defaults
 from lrm.nerf import TriplaneNeRF
-from lrm.triplane import sample_triplane
+from lrm.triplane import sample_triplane, tv_loss
 from lrm.renderer import volume_render
 from lrm.losses import LRMLoss
 
@@ -38,9 +39,19 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-2)
     ap.add_argument("--nerf_lr", type=float, default=1e-3)
     ap.add_argument("--w_lpips", type=float, default=0.25)
-    ap.add_argument("--bound", type=float, default=0.6)
-    ap.add_argument("--n_samples", type=int, default=48)
+    ap.add_argument("--w_tv", type=float, default=5e-4,
+                    help="triplane TV regularizasyonu. 0 = ESKI DAVRANIS: "
+                         "olculdu, TV'siz ogretmen varyansinin %40.5'i gurultu "
+                         "ve distilasyon kaybina ~0.40 ogrenilemez taban koyuyor.")
+    ap.add_argument("--bound", type=float, default=defaults.BOUND)
+    ap.add_argument("--n_samples", type=int, default=defaults.N_SAMPLES)
     ap.add_argument("--out", default=OUT)
+    ap.add_argument("--ckpt_every", type=int, default=2000,
+                    help="ara kayit sikligi (0=kapat). ONCEDEN HIC YOKTU: kosu "
+                         "yarida kesilirse SAATLERCE is kayboluyordu; 24.6k objelik "
+                         "ogretmen bankasi ~23 saat surecek, bunsuz kosulamaz.")
+    ap.add_argument("--resume", action="store_true",
+                    help="--out dosyasindaki ara kayittan devam et")
     a = ap.parse_args()
     torch.manual_seed(0)
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -73,13 +84,36 @@ def main():
             den, rgb = nerf(sample_triplane(tp, pts, bound=a.bound))
             ins = (pts.abs().amax(-1, keepdim=True) <= a.bound).to(den.dtype)
             return den * ins, rgb
-        rgb, acc = volume_render(o, d, 0.8, 2.2, a.n_samples, q, bg_color=bg)
+        rgb, acc = volume_render(o, d, defaults.NEAR, defaults.FAR,
+                                 a.n_samples, q, bg_color=bg)
         V = c2w.shape[0]
         return (rgb.reshape(V, a.res, a.res, 3).permute(0, 3, 1, 2),
                 acc.reshape(V, a.res, a.res, 1).permute(0, 3, 1, 2))
 
+    def save(step, final=False):
+        os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
+        torch.save({"triplanes": triplanes.detach().cpu(), "nerf": nerf.state_dict(),
+                    "opt": opt.state_dict(), "sched": sched.state_dict(),
+                    "step": step, "done": final,
+                    "uids": ds.uids[:n], "cfg": vars(a)}, a.out)
+
+    start = 0
+    if a.resume and os.path.isfile(a.out):
+        ck = torch.load(a.out, map_location="cpu", weights_only=False)
+        if ck.get("done"):
+            print(f"{a.out} zaten tamamlanmis (adim {ck['step']}); yeniden fit gerekmiyor.",
+                  flush=True)
+            return
+        with torch.no_grad():
+            triplanes.copy_(ck["triplanes"].to(DEV))
+        nerf.load_state_dict(ck["nerf"])
+        if "opt" in ck:
+            opt.load_state_dict(ck["opt"]); sched.load_state_dict(ck["sched"])
+        start = ck["step"]
+        print(f"resume: adim {start}/{a.steps}", flush=True)
+
     rng = np.random.default_rng(0); t0 = time.time()
-    for step in range(a.steps):
+    for step in range(start, a.steps):
         opt.zero_grad(); agg = 0.0
         for _ in range(a.batch):
             i = int(rng.integers(n))
@@ -90,6 +124,8 @@ def main():
             rgb, acc = render(triplanes[i], it["sup_c2w"].to(DEV),
                               it["sup_K"].to(DEV), c)
             total, _ = loss_fn(rgb, acc, target, alpha)
+            if a.w_tv > 0:
+                total = total + a.w_tv * tv_loss(triplanes[i])
             (total / a.batch).backward(); agg += float(total) / a.batch
         opt.step(); sched.step()
         if step % 500 == 0 or step == a.steps - 1:
@@ -103,12 +139,12 @@ def main():
                     ps.append(float(((r + (1 - ac) - gt) ** 2).mean()))
                 psnr = -10 * math.log10(max(float(np.mean(ps)), 1e-9))
             el = time.time() - t0
-            eta = (a.steps - step - 1) / max((step + 1) / el, 1e-6) / 3600
+            eta = (a.steps - step - 1) / max((step - start + 1) / el, 1e-6) / 3600
             print(f"  step {step:6d}/{a.steps} loss={agg:.4f} PSNR={psnr:.2f}dB "
-                  f"[{(step+1)/el:.2f} it/s, kalan ~{eta:.1f} sa]", flush=True)
-    os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
-    torch.save({"triplanes": triplanes.detach().cpu(), "nerf": nerf.state_dict(),
-                "uids": ds.uids[:n], "cfg": vars(a)}, a.out)
+                  f"[{(step-start+1)/el:.2f} it/s, kalan ~{eta:.1f} sa]", flush=True)
+        if a.ckpt_every and step > start and step % a.ckpt_every == 0:
+            save(step)
+    save(a.steps, final=True)
     print(f"kaydedildi: {a.out}", flush=True)
     with torch.no_grad():
         rows = []

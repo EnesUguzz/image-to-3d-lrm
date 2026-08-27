@@ -146,7 +146,7 @@ def main():
     json.dump(dict(cfg=vars(a), hist=hist,
                    final=dict(psnr=psnr, top1=top1, mse=mse, mean_mse=mmse,
                               novel_psnr=npsnr, novel_top1=ntop1)),
-              open(f"{OUT}/{a.tag}.json", "w"), indent=1)
+              open(f"{OUT}/{a.tag}.json", "w", encoding="utf-8"), indent=1)
     print(f"[{a.tag}] BITTI gorulen={psnr:.2f}dB/top1={top1:.0%} "
           f"YENI-GORUNUM={npsnr:.2f}dB/top1={ntop1:.0%} "
           f"mse={mse:.4f} vs ortalama-baseline={mmse:.4f}", flush=True)

@@ -1,5 +1,11 @@
 # Render çıktıları / veri seti (çok büyük — repoya girmez)
-dataset/
+# NOT: "dataset/" değil "dataset/*" — böylece altındaki KÜÇÜK ve KRİTİK
+# liste dosyalarına istisna tanımlanabiliyor. Tezgâh uid kümeleri repoda
+# durmazsa A/B kolları oturumlar arasında aynı objeleri okuyamaz
+# (bkz. PROJE-DEVIR-BELGESI 7.1: aynı ayar, farklı 32 obje → top-1 %75/%19/%3).
+dataset/*
+!dataset/bench_uids_*.json
+!dataset/_ab_uids.json
 renders/
 views/
 *.glb

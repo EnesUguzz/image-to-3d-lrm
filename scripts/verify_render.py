@@ -11,7 +11,7 @@ def check_meta(render_dir, uid, num_views=16):
     meta_path = os.path.join(d, "meta.json")
     if not os.path.isfile(meta_path):
         return [f"{uid}: meta.json yok"]
-    meta = json.load(open(meta_path))
+    meta = json.load(open(meta_path, encoding="utf-8"))
     if meta.get("num_views") != num_views:
         problems.append(f"{uid}: num_views {meta.get('num_views')} != {num_views}")
     for i in range(num_views):

@@ -1,12 +1,14 @@
 """Standart hizli tezgah: N objeyi EZBERLEYEBILIYOR MU?
 Sistem dogruysa kucuk N'de train PSNR yuksek + retrieval %100 olmali.
 Tek degisken degistirip A/B karsilastirmak icin: --tag ile ayri metrik dosyasi."""
-import argparse, json, os, sys, time, math
+import argparse, contextlib, json, os, sys, time, math
 import numpy as np, torch
 import torch.nn.functional as F
 from PIL import Image
 sys.path.insert(0, os.path.dirname(__file__))
 from lrm import cameras
+from lrm import defaults
+from lrm import guards, runstamp
 from lrm.model import LRM
 from lrm.losses import LRMLoss
 
@@ -110,13 +112,14 @@ def evaluate(model, data, res, novel=False):
     """novel=True: egitimde HIC kullanilmamis bir kameradan render et (NOVEL_VIEW).
     Ezber ile gercek 3B rekonstruksiyonu ayirir."""
     model.eval()
-    preds, gts = [], []
+    preds, gts, accs = [], [], []
     for d in data:
         if novel:
-            rgb, _ = model(d["ii"], d["ic"], d["ik"], d["n_c2w"], d["n_K"], (res, res))
-            preds.append(rgb[0]); gts.append(d["n_gt"])
+            rgb, ac = model(d["ii"], d["ic"], d["ik"], d["n_c2w"], d["n_K"], (res, res))
+            preds.append(rgb[0]); gts.append(d["n_gt"]); accs.append(ac.mean())
         else:
-            rgb, _ = model(d["ii"], d["ic"], d["ik"], d["sc"][:1], d["sk"][:1], (res, res))
+            rgb, ac = model(d["ii"], d["ic"], d["ik"], d["sc"][:1], d["sk"][:1], (res, res))
+            accs.append(ac.mean())
             preds.append(rgb[0]); gts.append(d["prem"][0] + (1 - d["alpha"][0]))
     P, G = torch.stack(preds), torch.stack(gts)
     mse = ((P - G) ** 2).mean((1, 2, 3))
@@ -125,12 +128,36 @@ def evaluate(model, data, res, novel=False):
     top1 = (D.argmin(1) == torch.arange(len(data), device=DEV)).float().mean().item()
     mean_mse = ((P.mean(0, keepdim=True) - G) ** 2).mean().item()
     model.train()
-    return psnr, top1, mse.mean().item(), mean_mse, P, G
+    acc_mean = float(torch.stack(accs).mean().item())
+    return psnr, top1, mse.mean().item(), mean_mse, P, G, acc_mean
+
+
+def select_uids(uids_file_uids=None, n_obj=None, uids_csv="", all_uids=None):
+    """Tezgah uid kumesini sec. ONCELIK: uids_file > --uids > listeden adimlama.
+
+    KRITIK (2026-08-26'da yasandi): --uids_file verildiginde --n_obj'nin
+    VARSAYILANI kirpma yapmamali. Aksi halde bench_uids_250.json verilip
+    kosu sessizce 32 objeyle calisir ve "250-obje kapisi" diye kaydedilir.
+    n_obj ancak ACIKCA verildiginde kirpar (varsayilan None).
+    """
+    if uids_file_uids:
+        u = list(uids_file_uids)
+        return u[:n_obj] if n_obj else u
+    if uids_csv:
+        return [x for x in uids_csv.split(",") if x]
+    all_uids = all_uids or []
+    n = n_obj or 32
+    step = max(1, len(all_uids) // n) if all_uids else 1
+    return all_uids[::step][:n]
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--n_obj", type=int, default=32)
+    ap.add_argument("--n_obj", type=int, default=None,
+                    help="obje sayisi. --uids_file ile birlikte verilirse o listeyi "
+                         "KIRPAR; verilmezse liste oldugu gibi kullanilir "
+                         "(varsayilan kirpma yapmaz -- 250-obje kapisinin sessizce "
+                         "32 objeyle kosmasina yol acmisti). uids_file yoksa 32.")
     ap.add_argument("--steps", type=int, default=1500)
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--res", type=int, default=64)
@@ -143,9 +170,19 @@ def main():
     ap.add_argument("--fg_weight", type=float, default=5.0,
                     help="obje piksellerinin agirligi (kaplama %9 oldugu icin kritik)")
     ap.add_argument("--w_tv", type=float, default=5e-4)
-    ap.add_argument("--n_samples", type=int, default=48)
+    ap.add_argument("--n_samples", type=int, default=defaults.N_SAMPLES)
     ap.add_argument("--tag", default="baseline")
+    ap.add_argument("--amp", action="store_true",
+                    help="bf16 autocast; KAYIP DAIMA fp32'de hesaplanir. "
+                         "K2 kaydi ('bf16 rengi olduruyor') esit olmayan bir "
+                         "kosudan (1450 vs 2450 adim) geliyordu, yeniden test edilir.")
     ap.add_argument("--arch", default="joint", choices=["joint", "cross"])
+    ap.add_argument("--bound", type=float, default=defaults.BOUND,
+                    help="obje hacmi yari-kenari (denetim: maks obje yaricapi 0.540)")
+    ap.add_argument("--density_bias", type=float, default=0.0,
+                    help="baslangic yogunlugu (anti-cokus)")
+    ap.add_argument("--noise_std", type=float, default=0.0,
+                    help="egitimde ham yogunluk gurultusu")
     ap.add_argument("--train_encoder", action="store_true",
                     help="DINOv2'nin TAMAMINI egit")
     ap.add_argument("--unfreeze_last", type=int, default=0,
@@ -159,6 +196,11 @@ def main():
     ap.add_argument("--crop", type=float, default=1.0,
                     help="supervision hedefinde merkez-kirpma orani (0.6 => ~2.8x obje pikseli)")
     ap.add_argument("--uids", default="", help="virgulle ayrilmis uid listesi (kontrol koşulari icin)")
+    ap.add_argument("--uids_file", default="",
+                    help="SABIT tezgah kumesi json'i (dataset/bench_uids_32.json). "
+                         "A/B kollarini bununla sabitle: '--n_obj 32' ile listeden "
+                         "adimlamak train_list her yeniden uretildiginde BASKA objeler "
+                         "verir (bkz. PROJE-DEVIR-BELGESI 7.1).")
     ap.add_argument("--render_dir", default="dataset/renders",
                     help="render kok dizini (yeni set: dataset/renders_opp_score3)")
     ap.add_argument("--train_list", default="dataset/train_list.json",
@@ -173,17 +215,20 @@ def main():
     RENDER_DIR = a.render_dir
 
     all_uids = json.load(open(a.train_list, encoding="utf-8"))["train"]
-    if a.uids:
-        uids = [u for u in a.uids.split(",") if u]
-    else:
-        step_u = max(1, len(all_uids) // a.n_obj)
-        uids = all_uids[::step_u][:a.n_obj]
+    file_uids = None
+    if a.uids_file:
+        with open(a.uids_file, encoding="utf-8") as f:
+            file_uids = json.load(f)["uids"]
+    uids = select_uids(file_uids, a.n_obj, a.uids, all_uids)
+    print(f"  uid kaynagi: {a.uids_file or ('--uids' if a.uids else a.train_list)} "
+          f"-> {len(uids)} obje", flush=True)
     data = build(uids, a.res, a.crop)
 
     kw = {}
     if a.arch == "cross":
         kw["cross_attn"] = True
-    model = LRM(n_samples=a.n_samples, **kw).to(DEV)
+    model = LRM(n_samples=a.n_samples, density_bias=a.density_bias,
+                noise_std=a.noise_std, bound=a.bound, **kw).to(DEV)
     if a.init_from:
         model.load_state_dict(torch.load(a.init_from, map_location="cpu")["model"])
         print(f"  baslangic agirliklari: {a.init_from}", flush=True)
@@ -201,6 +246,9 @@ def main():
             p.requires_grad_(True)
     if a.train_encoder or a.unfreeze_last > 0:
         model.encoder.forward = model.encoder.forward.__wrapped__.__get__(model.encoder)
+    # M_enc4 dersi: "encoder acildi" iddiasi ancak AGIRLIKLAR degistiyse gecerli
+    enc_snap = (runstamp.weight_snapshot(model.encoder, only_trainable=True)
+                if (a.train_encoder or a.unfreeze_last > 0) else None)
     params = [p for p in model.parameters() if p.requires_grad]
     nparam = sum(p.numel() for p in params) / 1e6
     opt = torch.optim.AdamW(params, lr=a.lr, weight_decay=0.05, betas=(0.9, 0.95))
@@ -223,32 +271,54 @@ def main():
             d = data[int(rng.integers(len(data)))]
             c = torch.rand(3, device=DEV)
             target = d["prem"] + (1 - d["alpha"]) * c[None, :, None, None]
-            rgb, acc = model(d["ii"], d["ic"], d["ik"], d["sc"], d["sk"],
-                             (a.res, a.res), bg_color=c)
+            ctx = (torch.autocast("cuda", dtype=torch.bfloat16) if a.amp
+                   else contextlib.nullcontext())
+            with ctx:
+                rgb, acc = model(d["ii"], d["ic"], d["ik"], d["sc"], d["sk"],
+                                 (a.res, a.res), bg_color=c)
+            rgb, acc = rgb.float(), acc.float()      # kayip daima fp32'de
             loss_fn.w_lpips = (0.0 if step < a.lpips_start * a.steps else a.w_lpips)
             total, parts = loss_fn(rgb, acc, target, d["alpha"])
             if a.w_tv > 0:
-                total = total + a.w_tv * model.tv_loss(model._last_triplane)
+                total = total + a.w_tv * model.tv_loss(model._last_triplane.float())
             (total / a.batch).backward()
             agg += float(total) / a.batch
         torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt.step(); sched.step()
         if step % a.eval_every == 0 or step == a.steps - 1:
-            psnr, top1, mse, mmse, P, G = evaluate(model, data, a.res)
-            hist.append(dict(step=step, loss=agg, psnr=psnr, top1=top1, mse=mse, mean_mse=mmse))
+            psnr, top1, mse, mmse, P, G, accm = evaluate(model, data, a.res)
+            rep = guards.collapse_flags(preds=P, acc_mean=accm,
+                                        psnr_history=[h["psnr"] for h in hist] + [psnr])
+            hist.append(dict(step=step, loss=agg, psnr=psnr, top1=top1, mse=mse,
+                             mean_mse=mmse, acc_mean=accm,
+                             inter_std=rep["inter_std"], flags=rep["flags"]))
             print(f"  step {step:5d} loss={agg:.4f} trainPSNR={psnr:.2f}dB top1={top1:.0%} "
                   f"mse={mse:.4f} ortalama-baseline={mmse:.4f} "
-                  f"[{(step+1)/(time.time()-t0):.2f} it/s]", flush=True)
-    psnr, top1, mse, mmse, P, G = evaluate(model, data, a.res)
+                  f"[{(step+1)/(time.time()-t0):.2f} it/s] {guards.format_flags(rep)}",
+                  flush=True)
+    psnr, top1, mse, mmse, P, G, accm = evaluate(model, data, a.res)
     n = min(8, len(data))
     grid = torch.cat([torch.cat([G[i], P[i]], -1) for i in range(n)], 1)
     Image.fromarray((grid.clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
                     ).save(f"{OUT}/{a.tag}.png")
+    rep = guards.collapse_flags(preds=P, acc_mean=accm,
+                                psnr_history=[h["psnr"] for h in hist] + [psnr])
+    enc_delta = runstamp.weight_delta(model.encoder, enc_snap) if enc_snap else {}
     json.dump(dict(cfg=vars(a), params_M=nparam, hist=hist,
-                   final=dict(psnr=psnr, top1=top1, mse=mse, mean_mse=mmse)),
-              open(f"{OUT}/{a.tag}.json", "w"), indent=1)
+                   stamp=runstamp.run_stamp(vars(a)),
+                   guard=rep, uids=uids,
+                   encoder_delta=dict(changed=runstamp.changed_count(enc_delta),
+                                      total=len(enc_delta),
+                                      max=max(enc_delta.values(), default=0.0)),
+                   final=dict(psnr=psnr, top1=top1, mse=mse, mean_mse=mmse,
+                              acc_mean=accm, inter_std=rep["inter_std"],
+                              degenerate=rep["degenerate"])),
+              open(f"{OUT}/{a.tag}.json", "w", encoding="utf-8"), indent=1)
+    if enc_snap:
+        print("  " + runstamp.format_delta(enc_delta, "encoder"), flush=True)
     print(f"[{a.tag}] BITTI trainPSNR={psnr:.2f}dB top1={top1:.0%} "
-          f"mse={mse:.4f} vs ortalama-baseline={mmse:.4f}", flush=True)
+          f"mse={mse:.4f} vs ortalama-baseline={mmse:.4f} {guards.format_flags(rep)}"
+          + ("  <<< SIRALAMAYA SOKMA" if rep["degenerate"] else ""), flush=True)
 
 
 if __name__ == "__main__":

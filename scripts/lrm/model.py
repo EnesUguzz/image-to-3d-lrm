@@ -3,8 +3,9 @@ import torch
 import torch.nn as nn
 
 from lrm import cameras
+from lrm import defaults
 from lrm.transformer import LRMTransformer
-from lrm.triplane import TriplaneHead, sample_triplane
+from lrm.triplane import TriplaneHead, sample_triplane, tv_loss as _tv_loss
 from lrm.nerf import TriplaneNeRF
 from lrm.renderer import volume_render
 from lrm.encoder import DinoEncoder
@@ -15,8 +16,9 @@ class LRM(nn.Module):
 
     def __init__(self, dim=512, depth=12, heads=8, triplane_res=32,
                  triplane_ch=32, nerf_hidden=64, encoder=None,
-                 bound=0.6, near=0.8, far=2.2, n_samples=64, white_bg=True,
-                 cross_attn=False):
+                 bound=defaults.BOUND, near=defaults.NEAR, far=defaults.FAR,
+                 n_samples=defaults.N_SAMPLES, white_bg=True,
+                 cross_attn=False, density_bias=0.0, noise_std=0.0):
         super().__init__()
         self.encoder = encoder if encoder is not None else DinoEncoder()
         self.cross_attn = cross_attn
@@ -25,7 +27,13 @@ class LRM(nn.Module):
                                           img_dim=self.encoder.embed_dim,
                                           cross_attn=cross_attn)
         self.triplane_head = TriplaneHead(dim=dim, out_channels=triplane_ch)
-        self.nerf = TriplaneNeRF(in_dim=3 * triplane_ch, hidden=nerf_hidden)
+        # ANTI-COKUS: yogunluk sifira oturunca softplus gradyani olur ve model
+        # 'bos sahne' sogurucu durumundan bir daha cikamaz -- M_base, M_enc4 ve
+        # K2_bf16 tam olarak boyle coktu (acc=0.0000). density_bias sisli bir
+        # baslangic verir, noise_std sert doygunlugu engeller (NeRF raw_noise_std).
+        # Cengeller nerf.py'de vardi ama buraya HIC baglanmamisti (K4).
+        self.nerf = TriplaneNeRF(in_dim=3 * triplane_ch, hidden=nerf_hidden,
+                                 density_bias=density_bias, noise_std=noise_std)
         self.bound, self.near, self.far, self.n_samples = bound, near, far, n_samples
         self.white_bg = white_bg  # beyaz arka plan: rgb'nin siyaha cokme tuzagini onler
         self.patch = self.encoder.patch
@@ -59,11 +67,8 @@ class LRM(nn.Module):
 
     @staticmethod
     def tv_loss(triplane):
-        """Toplam-varyasyon: komsu triplane hucreleri arasi ani sicramalari cezalar
-        => gurultu/sis azalir, yuzey duzgunlesir (OpenLRM reçetesi, TV 5e-4)."""
-        dh = (triplane[..., 1:, :] - triplane[..., :-1, :]).abs().mean()
-        dw = (triplane[..., :, 1:] - triplane[..., :, :-1]).abs().mean()
-        return dh + dw
+        """OpenLRM recetesi, TV 5e-4. Gercek uygulama lrm/triplane.py'de (ortak)."""
+        return _tv_loss(triplane)
 
     def render_view(self, triplane, c2w, K, H, W, bg_color=None):
         o, d = cameras.rays_from_camera(c2w, K, H, W)

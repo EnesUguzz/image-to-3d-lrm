@@ -198,7 +198,7 @@ def main():
         Image.fromarray((torch.cat(imgs, 1).clamp(0, 1).permute(1, 2, 0).cpu().numpy()
                          * 255).astype(np.uint8)).save(f"{OUT}/{a.tag}.png")
     json.dump(dict(cfg=vars(a), n_obj=len(data), hist=hist),
-              open(f"{OUT}/{a.tag}.json", "w"), indent=1)
+              open(f"{OUT}/{a.tag}.json", "w", encoding="utf-8"), indent=1)
     print(f"[{a.tag}] BITTI  fitPSNR={hist[-1]['fit_psnr']:.2f}dB  "
           f"ALT-heldout={hist[-1]['eval_psnr']:.2f}dB", flush=True)
 

@@ -15,7 +15,10 @@ from PIL import Image
 import torch.nn as nn
 
 from lrm import cameras
-from lrm.dataset import LRMDataset, _load_rgba
+from lrm import defaults
+from lrm import metrics as MET
+from lrm import guards, runstamp
+from lrm.dataset import LRMDataset, _load_rgba, lrm_collate
 from lrm.model import LRM
 from lrm.losses import LRMLoss
 from lrm.triplane import sample_triplane
@@ -41,14 +44,36 @@ def setup_logging():
     return logger
 
 
-def save_checkpoint(path, model, opt, scheduler, step, teacher=None, opt_t=None):
+def save_checkpoint(path, model, opt, scheduler, step, teacher=None, opt_t=None,
+                    force=False, stamp=None):
+    """Checkpoint yazar. Yazdiysa True, GERI CEVIRDIYSE False doner.
+
+    GERI CEVIRME KURALI -- gercekten yasandi (2026-08-26): 40 adimlik bir duman
+    testi, kosu sonunda kosulsuz save_checkpoint cagirdigi icin 16.000 adimlik
+    gece kosusunun last.pt'sini ezdi ve o checkpoint geri getirilemedi.
+    Artik daha KUCUK adimli bir kayit, daha buyuk adimli mevcut bir kaydin
+    uzerine `force=True` olmadan yazamaz."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    if not force and os.path.isfile(path):
+        try:
+            prev = torch.load(path, map_location="cpu", weights_only=False).get("step", -1)
+        except Exception:
+            prev = -1
+        if prev > step:
+            logging.getLogger("train_lrm").warning(
+                f"checkpoint YAZILMADI: {path} zaten adim {prev} iceriyor, "
+                f"yazilmak istenen adim {step}. Bilerek ezmek icin force=True "
+                f"(ya da --ckpt_dir ile ayri bir dizine yaz).")
+            return False
     ck = {"model": model.state_dict(), "opt": opt.state_dict(),
           "sched": scheduler.state_dict(), "step": step}
+    if stamp is not None:
+        ck["stamp"] = stamp
     if teacher is not None:   # resume'da ogretmen sifirdan baslamasin
         ck["teacher"] = teacher.detach().cpu()
         ck["opt_t"] = opt_t.state_dict()
     torch.save(ck, path)
+    return True
 
 
 def load_checkpoint(path, model, opt, scheduler):
@@ -85,47 +110,95 @@ def build_val_probe(renders_dir, uids, render_res, input_res=224, device="cuda")
         i_in = canon[0]
         rgba = _load_rgba(os.path.join(renders_dir, uid, views[i_in]["file"]), input_res)
         img = rgba[:3] * rgba[3:4] + (1.0 - rgba[3:4])          # temiz beyaz bg
-        tg_rgb, tg_c2w, tg_K = [], [], []
+        tg_rgb, tg_c2w, tg_K, tg_alpha = [], [], [], []
         for i in canon[1:3]:
             r = _load_rgba(os.path.join(renders_dir, uid, views[i]["file"]), render_res)
             tg_rgb.append(r[:3] * r[3:4] + (1.0 - r[3:4]))      # beyaz kompozit hedef
+            tg_alpha.append(r[3:4])                             # siluet IoU icin
             tg_c2w.append(c2w(i)); tg_K.append(K_for(i, render_res))
         probe.append(dict(
             uid=uid,
             ii=img[None].to(device), ic=c2w(i_in)[None].to(device),
             ik=K_for(i_in, input_res)[None].to(device),
             tc=torch.stack(tg_c2w).to(device), tk=torch.stack(tg_K).to(device),
-            gt=torch.stack(tg_rgb).to(device)))
+            gt=torch.stack(tg_rgb).to(device),
+            ga=torch.stack(tg_alpha).to(device)))
     return probe
 
 
 @torch.no_grad()
-def val_metrics(model, probe, render_res, device="cuda"):
-    """Genelleme olcumu -- TEK fotodan, gorulmemis objelerde.
-      psnr   : rekonstruksiyon kalitesi (dB)
-      top1   : tahmin kendi objesinin GT'sine mi en yakin (conditioning testi;
-               sans = 1/N). Dusukse model girdiyi kullanmiyor demektir.
-      oran   : mse / ortalama-obje-baseline. 1.0 = 'herkese ayni blob' cokusu,
-               kucuk = gercekten objeye ozgu cikti.
+def val_metrics(model, probe, render_res, device="cuda", psnr_history=None,
+                full=True):
+    """Genelleme olcumu -- TEK fotodan, GORULMEMIS objelerde (val split).
+
+    KATMAN 1+2+4, lrm/metrics.py'deki ORTAK tanimlarla (eval_suite.py ile ayni kod).
+
+    NEDEN TAM SET EGITIM ICINDE (2026-08-27):
+    Onceden sadece PSNR + top1 + oran vardi. 14 saatlik bir kosuda kalite
+    bozulmasini tek bir sayidan gormek zor; ayrica PSNR bulaniklasmaya karsi
+    kor, LPIPS/IoU degil. Meshy 7'nin kendi raporundaki ders: hizalama sinyali
+    "sonda uygulanan bir degerlendirme" degil, "her egitim donusunde izlenen
+    sinyal" olmali.
+
+    Doner (eski anahtarlar korunur):
+      psnr/ssim/lpips/iou : ortalama; *_p10 (veya lpips_p90) = kotu uc dilim
+      top1                : conditioning (sans = 1/N)
+      ratio               : mse / ortalama-baseline (1.0 = blob cokusu)
+      taban_psnr          : TABAN  -- ortalama-obje baseline'i
+      komsu_psnr/komsu_top1 : RAKIP -- en-yakin-komsu retrieval (Tatarchenko)
+      acc_mean/inter_std/flags/degenerate : cokus dedektoru
     """
     if not probe:
         return None
     model.eval()
-    preds, gts = [], []
+    preds, accs = [], []
     for d in probe:
-        rgb, _ = model(d["ii"], d["ic"], d["ik"], d["tc"], d["tk"],
-                       (render_res, render_res), bg_color=torch.ones(3, device=device))
-        preds.append(rgb); gts.append(d["gt"])
-    P, G = torch.stack(preds), torch.stack(gts)        # (N,2,3,H,W)
-    mse_i = ((P - G) ** 2).mean((1, 2, 3, 4))
-    psnr = (-10 * torch.log10(mse_i.clamp_min(1e-9))).mean().item()
-    D = ((P[:, None] - G[None]) ** 2).mean((2, 3, 4, 5))
-    top1 = (D.argmin(1) == torch.arange(len(probe), device=device)).float().mean().item()
+        rgb, ac = model(d["ii"], d["ic"], d["ik"], d["tc"], d["tk"],
+                        (render_res, render_res), bg_color=torch.ones(3, device=device))
+        preds.append(rgb); accs.append(ac)
+    P = torch.stack(preds)                              # (N,V,3,H,W)
+    A = torch.stack(accs)
+    G = torch.stack([d["gt"] for d in probe])
+    Ag = torch.stack([d["ga"] for d in probe])
+
+    psnr_i, mse_i = MET.psnr_per_object(P, G)
+    top1 = MET.top1_retrieval(P, G)
+    ratio = MET.mean_baseline_ratio(P, G)
     mean_mse = ((P.mean(0, keepdim=True) - G) ** 2).mean().item()
+
+    per = {"psnr": psnr_i}
+    if full:
+        per.update(MET.image_metrics(P, G, A, Ag, device=device,
+                                     use_lpips=True, use_clip=False))
+    else:
+        per["iou"] = MET.mask_iou_per_object(A, Ag)
+    summ = MET.summarize(per)
+
+    # --- KATMAN 4: TABAN ve RAKIP (metrik kalibre olsun diye her raporda)
+    Pm = G.mean(0, keepdim=True).expand_as(G)
+    taban_psnr = float(MET.psnr_per_object(Pm, G)[0].mean())
+    inputs = torch.cat([d["ii"] for d in probe])
+    j = MET.neighbor_indices(inputs)
+    Pn = G[j]
+    komsu_psnr = float(MET.psnr_per_object(Pn, G)[0].mean())
+    komsu_top1 = MET.top1_retrieval(Pn, G)
+
     model.train()
-    mse = mse_i.mean().item()
-    return dict(psnr=psnr, top1=top1, mse=mse, mean_mse=mean_mse,
-                ratio=mse / max(mean_mse, 1e-9), n=len(probe))
+    acc_mean = float(A.mean().item())
+    rep = guards.collapse_flags(preds=P, acc_mean=acc_mean, psnr_history=psnr_history)
+    out = dict(psnr=summ["psnr"]["ort"], psnr_med=summ["psnr"]["med"],
+               psnr_p10=summ["psnr"]["p10"],
+               top1=top1, mse=float(mse_i.mean()), mean_mse=mean_mse,
+               ratio=ratio, n=len(probe), acc_mean=acc_mean,
+               inter_std=rep["inter_std"], flags=rep["flags"],
+               degenerate=rep["degenerate"],
+               taban_psnr=taban_psnr, komsu_psnr=komsu_psnr, komsu_top1=komsu_top1)
+    for k in ("ssim", "lpips", "iou"):
+        if k in summ:
+            out[k] = summ[k]["ort"]
+            out[f"{k}_p10" if k != "lpips" else "lpips_p90"] = (
+                summ[k].get("p10", summ[k].get("p90")))
+    return out
 
 
 def save_val_grid(model, dataset, uids, device, path, render_res):
@@ -147,13 +220,20 @@ def save_val_grid(model, dataset, uids, device, path, render_res):
 
 
 def train(train_list, renders_dir, steps=40000, micro_batch=2, grad_accum=4,
-          render_res=128, n_sup=4, lr=4e-4, warmup=500, ckpt_every=2000,
+          render_res=128, n_sup=3, lr=4e-4, warmup=500, ckpt_every=2000,
           val_every=1000, resume=False, device="cuda", amp=True, grad_ckpt=False,
-          n_samples=48, w_lpips=0.25, w_tv=5e-4, low_res=64, coarse_frac=0.5,
+          n_samples=defaults.N_SAMPLES, w_lpips=0.25, w_tv=5e-4,
+          low_res=64, coarse_frac=0.0,
           cross_attn=False, augment=True, teacher_subset=512, w_distill=1.0,
           teacher_off=0.5, teacher_lr=1e-2, teacher_init="", freeze_nerf=True,
-          train_encoder=False, unfreeze_last=0, val_n=64, max_input=None):
+          train_encoder=False, unfreeze_last=0, val_n=64, max_input=None,
+          collapse_after=None, region=64, render_low=64, render_high=192,
+          fg_bias=0.75, workers=6, density_bias=0.0, noise_std=0.0,
+          bound=defaults.BOUND):
     logger = setup_logging()
+    # Egitilmemis model TANIMI GEREGI 'ortalama obje' cokusundedir; alarmi
+    # basindan calarsak alarm yorgunlugu olur ve gercek cokus fark edilmez.
+    collapse_after = 2 * warmup if collapse_after is None else collapse_after
     # TF32: Blackwell'de matmul'u hizlandirir, cikti fp32 kalir (bf16'nin renk-oldurme
     # sorunu YOK). cudnn.benchmark: sabit boyutlu render icin en hizli kerneli sec.
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -162,10 +242,17 @@ def train(train_list, renders_dir, steps=40000, micro_batch=2, grad_accum=4,
     train_ds = LRMDataset(train_list, renders_dir, split="train",
                           render_res=render_res, n_sup=n_sup, augment=augment,
                           max_input=max_input,
+                          # BOLGE KIRPMA (OpenLRM/TripoSR): isin butcesi region^2'de
+                          # sabit, ama yamadaki obje orani cok yuksek. Sabit
+                          # coarse-to-fine faz gecisinin yerine gecer.
+                          region=region, render_low=render_low,
+                          render_high=render_high, fg_bias=fg_bias,
                           # gorunum rastgeleligi augment'ten BAGIMSIZ olmali:
                           # --no_augment ile deterministik olunca her obje hep ayni
                           # 4 supervision gorunumunu goruyordu (16 render'in 12'si olu)
                           deterministic=False)
+    # VAL KIRPILMAZ: metrik tum gecmisle karsilastirilabilir kalmali
+    # (sabit kamera, tam kare, sabit cozunurluk).
     val_ds = LRMDataset(train_list, renders_dir, split="val",
                         render_res=render_res, n_sup=n_sup, augment=False)
     val_uids = val_ds.uids[:6]
@@ -173,12 +260,33 @@ def train(train_list, renders_dir, steps=40000, micro_batch=2, grad_accum=4,
     val_probe = build_val_probe(renders_dir, val_ds.uids[:val_n], render_res,
                                 device=device)
     val_jsonl = os.path.join(LOG_DIR, "val_metrics.jsonl")
+    # Veri yukleme senkronken ornek basina ~25 ms CPU maliyeti vardi; hizlanma
+    # sonrasi adimin ~%45'i olurdu. Worker'lar bunu GPU hesabiyla ortusturur.
+    loader = torch.utils.data.DataLoader(
+        train_ds, batch_size=micro_batch, shuffle=True, drop_last=True,
+        num_workers=workers, collate_fn=lrm_collate,
+        persistent_workers=bool(workers), pin_memory=False,
+        **({"prefetch_factor": 4} if workers else {}))
+    _it = iter(loader)
+
+    def next_batch():
+        nonlocal _it
+        try:
+            return next(_it)
+        except StopIteration:
+            _it = iter(loader)
+            return next(_it)
+
     logger.info(f"egitim: {len(train_ds)} train, {len(val_ds)} val | render {render_res} "
+                f"| region {region} (U[{render_low},{render_high}], fg_bias {fg_bias}) "
+                f"| workers {workers} | n_sup {n_sup} "
                 f"| micro_batch {micro_batch} x grad_accum {grad_accum} | lr {lr} "
                 f"| amp {amp} | grad_ckpt {grad_ckpt} | cross_attn {cross_attn} "
                 f"| augment {augment}")
 
-    model = LRM(n_samples=n_samples, cross_attn=cross_attn).to(device)
+    model = LRM(n_samples=n_samples, cross_attn=cross_attn,
+                density_bias=density_bias, noise_std=noise_std,
+                bound=bound).to(device)
     if grad_ckpt:  # VRAM bol oldugu icin varsayilan kapali (hiz icin)
         model.transformer.enable_checkpointing()
     # LPIPS agirligi 0.25 (OLCULDU, 32-obje tezgahi, ayni 2000 adimlik program):
@@ -207,6 +315,19 @@ def train(train_list, renders_dir, steps=40000, micro_batch=2, grad_accum=4,
     params = [p for p in model.parameters() if p.requires_grad]
     logger.info(f"egitilebilir parametre: {sum(p.numel() for p in params)/1e6:.1f}M "
                 f"| enc_train={train_encoder or unfreeze_last} | val_probe={len(val_probe)}")
+    _stamp = runstamp.run_stamp(dict(train_list=train_list, renders_dir=renders_dir,
+                                     steps=steps, micro_batch=micro_batch,
+                                     grad_accum=grad_accum, render_res=render_res,
+                                     n_sup=n_sup, lr=lr, w_lpips=w_lpips,
+                                     n_samples=n_samples, amp=amp,
+                                     train_encoder=train_encoder,
+                                     unfreeze_last=unfreeze_last))
+    logger.info(f"kunye: git={_stamp['git_sha']}{'+kirli' if _stamp['git_dirty'] else ''} "
+                f"cfg={_stamp['config_hash']} torch={_stamp['torch']} gpu={_stamp['gpu']}")
+    # M_enc4 dersi: "encoder acildi" iddiasi ancak AGIRLIKLAR degistiyse gecerli
+    _enc_snap = (runstamp.weight_snapshot(model.encoder, only_trainable=True)
+                 if (train_encoder or unfreeze_last > 0) else None)
+    _psnr_hist = []
     opt = torch.optim.AdamW(params, lr=lr, weight_decay=0.05, betas=(0.9, 0.95))
 
     def lr_lambda(s):
@@ -309,13 +430,15 @@ def train(train_list, renders_dir, steps=40000, micro_batch=2, grad_accum=4,
             for _p in model.nerf.parameters():
                 _p.requires_grad_(not use_teacher)
         agg = {"total": 0.0, "mse": 0.0, "mask": 0.0, "lpips": 0.0, "tv": 0.0}
-        # coarse-to-fine: erken adimlar dusuk cozunurluk (render maliyeti ~res^2 => cok
-        # daha hizli kaba geometri), sonra tam cozunurlukte rafine (LRM/OpenLRM recetesi)
-        cur_res = low_res if step < coarse_until else render_res
+        # Sabit coarse-to-fine KALDIRILDI (varsayilan coarse_frac=0). Olculdu (gece
+        # kosusu): 1.25x hiz kazandirdi (kosunun %11'i) ama gecerken mask kaybini
+        # 2x sicratti (toparlanma 540 adim) ve kaba fazin 8000 adiminda top-1 hic
+        # sanstan yukari cikmadi. Yerine BOLGE KIRPMA geldi: isin butcesi kalici
+        # olarak region^2, ama yamadaki obje orani cok daha yuksek.
+        cur_res = low_res if (coarse_frac > 0 and step < coarse_until) else None
         for _ in range(grad_accum):
-            for _ in range(micro_batch):
-                ds_idx = int(rng.integers(len(train_ds)))
-                it = train_ds[ds_idx]
+            for it in next_batch():
+                ds_idx = it["idx"]
                 to = lambda t: t.to(device)
                 ctx = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
                        if amp else contextlib.nullcontext())
@@ -323,26 +446,32 @@ def train(train_list, renders_dir, steps=40000, micro_batch=2, grad_accum=4,
                 # girdiyi yok sayip sabit bg basma kisayolunu kullanamaz (renk-cokme fix)
                 alpha = to(it["sup_alpha"])
                 prem = to(it["sup_premult"])
-                if cur_res != render_res:  # hedefleri render cozunurluguene indir
+                res_i = it["sup_res"]
+                if cur_res is not None and cur_res != res_i:
                     alpha = F.interpolate(alpha, size=(cur_res, cur_res), mode="bilinear",
                                           align_corners=False)
                     prem = F.interpolate(prem, size=(cur_res, cur_res), mode="bilinear",
                                          align_corners=False)
+                    res_i = cur_res
                 c = torch.rand(3, device=device)
                 target = prem + (1.0 - alpha) * c[None, :, None, None]
                 with ctx:
                     rgb, acc = model(to(it["input_imgs"]), to(it["input_c2w"]),
                                      to(it["input_K"]), to(it["sup_c2w"]), to(it["sup_K"]),
-                                     (cur_res, cur_res), bg_color=c)
+                                     (res_i, res_i), bg_color=c)
+                # KAYIP DAIMA fp32'DE: bf16 forward hizli, ama genis toplamlarin
+                # (mse/mask normalizasyonu, LPIPS) hassasiyeti bf16'da dusuyor.
+                rgb, acc = rgb.float(), acc.float()
+                if True:
                     total, parts = loss_fn(rgb, acc, target, alpha)
                     if w_tv > 0:  # triplane duzgunluk regülarizasyonu (anti-sis)
-                        tv = model.tv_loss(model._last_triplane)
+                        tv = model.tv_loss(model._last_triplane.float())
                         total = total + w_tv * tv
                         parts["tv"] = tv.detach()
                     if use_teacher and ds_idx < n_teacher:
                         tp_t = teacher[ds_idx]
                         rgb_t, acc_t = render_teacher(tp_t, to(it["sup_c2w"]),
-                                                      to(it["sup_K"]), cur_res, c)
+                                                      to(it["sup_K"]), res_i, c)
                         lt, _ = loss_fn(rgb_t, acc_t, target, alpha)
                         # distilasyon ogretmenin varyansina normalize (olcekten bagimsiz)
                         td = tp_t.detach()
@@ -364,25 +493,54 @@ def train(train_list, renders_dir, steps=40000, micro_batch=2, grad_accum=4,
             vram = torch.cuda.max_memory_allocated() / 1e9 if device == "cuda" else 0
             logger.info(f"step {step}/{steps} loss={agg['total']:.4f} "
                         f"mse={agg['mse']:.4f} mask={agg['mask']:.4f} lpips={agg['lpips']:.4f} "
-                        f"tv={agg['tv']:.4f} res={cur_res} "
+                        f"tv={agg['tv']:.4f} res={res_i} "
                         f"{'ogr' if use_teacher else '---'} "
                         f"lr={scheduler.get_last_lr()[0]:.2e} {speed:.2f}it/s vram={vram:.1f}GB")
         if step > 0 and step % val_every == 0:
             save_val_grid(model, val_ds, val_uids, device,
                           os.path.join(PREVIEW_DIR, f"val_{step:06d}.png"), render_res)
-            vm = val_metrics(model, val_probe, render_res, device)
+            vm = val_metrics(model, val_probe, render_res, device,
+                             psnr_history=_psnr_hist)
             if vm:
-                logger.info(f"[VAL step {step}] psnr={vm['psnr']:.2f}dB "
-                            f"top1={vm['top1']:.1%} (sans {1/vm['n']:.1%}) "
-                            f"mse={vm['mse']:.4f} ortalama-baseline={vm['mean_mse']:.4f} "
-                            f"oran={vm['ratio']:.3f}")
+                _psnr_hist.append(vm["psnr"])
+                # TAVAN yok (val objelerinin ogretmeni yok) ama TABAN ve RAKIP
+                # her satirda: tek basina bir PSNR sayisi yorumlanamaz.
+                logger.info(
+                    f"[VAL step {step}] psnr={vm['psnr']:.2f}dB "
+                    f"(med {vm['psnr_med']:.2f} p10 {vm['psnr_p10']:.2f}) "
+                    f"| taban {vm['taban_psnr']:.2f} rakip {vm['komsu_psnr']:.2f} "
+                    f"| top1={vm['top1']:.1%} (sans {1/vm['n']:.1%}) "
+                    f"oran={vm['ratio']:.3f} " + guards.format_flags(vm))
+                if "lpips" in vm:
+                    logger.info(
+                        f"  ssim={vm.get('ssim', float('nan')):.3f} "
+                        f"lpips={vm['lpips']:.3f} (p90 {vm.get('lpips_p90', float('nan')):.3f}) "
+                        f"iou={vm.get('iou', float('nan')):.3f} "
+                        f"(p10 {vm.get('iou_p10', float('nan')):.3f})")
+                if vm["psnr"] <= vm["komsu_psnr"]:
+                    logger.warning(
+                        f"[VAL step {step}] model EN-YAKIN-KOMSU baseline'ini gecemiyor "
+                        f"({vm['psnr']:.2f} <= {vm['komsu_psnr']:.2f} dB) -- "
+                        "rekonstruksiyon degil retrieval yapiyor olabilir "
+                        "(Tatarchenko ve ark., CVPR 2019).")
+                if vm["degenerate"] and step >= collapse_after:
+                    logger.warning(
+                        f"[VAL step {step}] DEJENERE CIKTI ({','.join(vm['flags'])}) -- "
+                        "model girdiden bagimsiz sabit cikti uretiyor. "
+                        "Kosuyu durdurup tarifeyi gozden gecir "
+                        "(bkz. docs/egitim-oncesi-hazirlik-plani.md 1.1).")
+                if _enc_snap is not None:
+                    logger.info("  " + runstamp.format_delta(
+                        runstamp.weight_delta(model.encoder, _enc_snap), "encoder"))
                 with open(val_jsonl, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(dict(step=step, **vm)) + chr(10))
+                    f.write(json.dumps(dict(step=step, stamp=_stamp["config_hash"],
+                                            **vm)) + chr(10))
         if step > 0 and step % ckpt_every == 0:
-            save_checkpoint(last_ckpt, model, opt, scheduler, step,
-                            teacher if opt_t is not None else None, opt_t)
-            logger.info(f"checkpoint kaydedildi: {last_ckpt}")
-    save_checkpoint(last_ckpt, model, opt, scheduler, steps)
+            if save_checkpoint(last_ckpt, model, opt, scheduler, step,
+                               teacher if opt_t is not None else None, opt_t,
+                               stamp=_stamp):
+                logger.info(f"checkpoint kaydedildi: {last_ckpt}")
+    save_checkpoint(last_ckpt, model, opt, scheduler, steps, stamp=_stamp)
     logger.info("egitim bitti")
 
 
@@ -394,7 +552,8 @@ if __name__ == "__main__":
     ap.add_argument("--micro_batch", type=int, default=2)
     ap.add_argument("--grad_accum", type=int, default=4)
     ap.add_argument("--render_res", type=int, default=128)
-    ap.add_argument("--n_sup", type=int, default=4)
+    ap.add_argument("--n_sup", type=int, default=3,
+                    help="supervision gorunum sayisi (OpenLRM 3)")
     ap.add_argument("--lr", type=float, default=4e-4)
     ap.add_argument("--warmup", type=int, default=500)
     ap.add_argument("--ckpt_every", type=int, default=2000)
@@ -406,7 +565,7 @@ if __name__ == "__main__":
                     help="bf16 mixed precision (DIKKAT: rengi ogrenmiyor, sadece hiz denemesi icin)")
     ap.add_argument("--grad_ckpt", action="store_true",
                     help="gradient checkpointing (VRAM darsa; varsayilan kapali)")
-    ap.add_argument("--n_samples", type=int, default=48,
+    ap.add_argument("--n_samples", type=int, default=defaults.N_SAMPLES,
                     help=" isin basi ornek (hiz/kalite; overfit'te 48 kusursuz)")
     ap.add_argument("--w_lpips", type=float, default=0.25,
                     help="LPIPS agirligi (olculdu: 0.25 optimum; 2.0 conditioning'i olduruyor)")
@@ -414,8 +573,32 @@ if __name__ == "__main__":
                     help="triplane TV regülarizasyonu (anti-sis; 0=kapat)")
     ap.add_argument("--low_res", type=int, default=64,
                     help="coarse-to-fine dusuk cozunurluk (erken adimlar; hiz)")
-    ap.add_argument("--coarse_frac", type=float, default=0.5,
-                    help="egitimin ilk bu orani low_res'te (0=kapat, hep render_res)")
+    ap.add_argument("--coarse_frac", type=float, default=0.0,
+                    help="SABIT coarse-to-fine. Varsayilan KAPALI: olculdu, 1.25x hiz "
+                         "verip mask kaybini 2x sicratiyor ve kaba fazda conditioning "
+                         "hic ilerlemiyor. Yerine --region kullaniliyor. A/B icin duruyor.")
+    ap.add_argument("--region", type=int, default=64,
+                    help="bolge kirpma boyutu (0=kapat, tam kare render_res). Isin "
+                         "butcesi region^2'de sabit kalir, yamadaki obje orani artar.")
+    ap.add_argument("--render_low", type=int, default=64,
+                    help="ornek basina render cozunurlugu alt siniri (OpenLRM 64)")
+    ap.add_argument("--render_high", type=int, default=192,
+                    help="ornek basina render cozunurlugu ust siniri (OpenLRM 192)")
+    ap.add_argument("--fg_bias", type=float, default=0.75,
+                    help="kirpmanin on plani kesme olasiligi (TripoSR tarzi)")
+    ap.add_argument("--bound", type=float, default=defaults.BOUND,
+                    help="obje hacmi yari-kenari. Denetim (14.454 obje) gercek "
+                         "obje yaricapini maks 0.540 olctu => 0.552 yeterli ve "
+                         "0.6 yerine 1.28x etkin hacim yogunlugu verir (T_bound).")
+    ap.add_argument("--density_bias", type=float, default=0.0,
+                    help="baslangic yogunlugu (anti-cokus). 0 = sert baslangic; "
+                         "1.0 civari 'sisli' baslatir, acc->0 sogurucu durumunu onler. "
+                         "M_base/M_enc4/K2_bf16 tam olarak oyle coktu.")
+    ap.add_argument("--noise_std", type=float, default=0.0,
+                    help="egitimde ham yogunluga gurultu (NeRF raw_noise_std); "
+                         "sert 0/inf doygunlugunu engeller")
+    ap.add_argument("--workers", type=int, default=6,
+                    help="DataLoader worker sayisi (0=senkron)")
     ap.add_argument("--cross_attn", action="store_true",
                     help="LRM-tarzi cross-attention + kamera modLN govdesi. OLCULDU: "
                          "32-obje tezgahinda joint self-attention ile AYNI sonuc "
@@ -442,6 +625,9 @@ if __name__ == "__main__":
                     help="DINOv2'nin son N blogunu egit (0=donuk)")
     ap.add_argument("--val_n", type=int, default=64,
                     help="sayisal val'de kullanilacak gorulmemis obje sayisi")
+    ap.add_argument("--collapse_after", type=int, default=None,
+                    help="cokus alarmini bu adimdan sonra cal (varsayilan 2*warmup). "
+                         "Egitilmemis model tanimi geregi ortalama-obje cokusundedir.")
     ap.add_argument("--max_input", type=int, default=None,
                     help="girdi gorunum tavani (None=meta'daki kanonik sayisi)")
     ap.add_argument("--no_augment", action="store_true",
@@ -457,4 +643,8 @@ if __name__ == "__main__":
           teacher_off=a.teacher_off, teacher_lr=a.teacher_lr,
           teacher_init=a.teacher_init, freeze_nerf=not a.no_freeze_nerf,
           train_encoder=a.train_encoder, unfreeze_last=a.unfreeze_last,
-          val_n=a.val_n, max_input=a.max_input)
+          val_n=a.val_n, max_input=a.max_input,
+          collapse_after=a.collapse_after, region=a.region,
+          render_low=a.render_low, render_high=a.render_high,
+          fg_bias=a.fg_bias, workers=a.workers,
+          density_bias=a.density_bias, noise_std=a.noise_std, bound=a.bound)

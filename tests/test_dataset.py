@@ -92,3 +92,44 @@ def test_val_deterministik_kalir(tmp_path):
     ds = LRMDataset(tl, rroot, split="train", render_res=32, augment=False)
     assert ds.deterministic is True
     assert ds[0]["sup_view_idx"] == ds[0]["sup_view_idx"]
+
+
+def test_bolge_kirpma_sekilleri_ve_on_plan_orani(tmp_path):
+    """region>0: hedefler region x region gelir ve on-plan orani TAM KAREYE gore
+    belirgin sekilde artar (kaybin %85'i arka plana gitmesin diye)."""
+    tl, rroot = _setup(tmp_path)
+    full = LRMDataset(tl, rroot, split="train", render_res=64, n_sup=4,
+                      augment=False, deterministic=False)
+    reg = LRMDataset(tl, rroot, split="train", render_res=64, n_sup=4,
+                     augment=False, deterministic=False,
+                     region=32, render_low=48, render_high=96, fg_bias=1.0)
+    it_f, it_r = full[0], reg[0]
+    assert it_f["sup_alpha"].shape[-1] == 64 and it_f["sup_res"] == 64
+    assert it_r["sup_alpha"].shape[-1] == 32 and it_r["sup_res"] == 32
+    assert it_r["sup_premult"].shape[-1] == 32
+    assert it_r["sup_K"].shape == (4, 3, 3)
+    # fg_bias=1.0 => her kirpma obje icermeli
+    assert float(it_r["sup_alpha"].amax()) > 0
+
+
+def test_bolge_kirpma_on_plan_yogunlugunu_ARTIRIR(tmp_path):
+    tl, rroot = _setup(tmp_path)
+    full = LRMDataset(tl, rroot, split="train", render_res=64, n_sup=4,
+                      augment=False, deterministic=False)
+    reg = LRMDataset(tl, rroot, split="train", render_res=64, n_sup=4,
+                     augment=False, deterministic=False,
+                     region=24, render_low=64, render_high=64, fg_bias=1.0)
+    cov_f = float(torch.stack([full[i]["sup_alpha"] for i in range(3)]).mean())
+    cov_r = float(torch.stack([reg[i]["sup_alpha"] for i in range(3)]).mean())
+    assert cov_r > cov_f, f"kirpma on-plani artirmadi: {cov_r:.3f} vs {cov_f:.3f}"
+
+
+def test_kirpma_kapaliyken_davranis_DEGISMEZ(tmp_path):
+    """Geriye donuk uyumluluk: region=0 eski yolu birebir korumali."""
+    tl, rroot = _setup(tmp_path)
+    a = LRMDataset(tl, rroot, split="train", render_res=64, n_sup=4,
+                   augment=False, deterministic=True, seed=7)
+    b = LRMDataset(tl, rroot, split="train", render_res=64, n_sup=4,
+                   augment=False, deterministic=True, seed=7, region=0)
+    assert torch.equal(a[0]["sup_premult"], b[0]["sup_premult"])
+    assert torch.equal(a[0]["sup_K"], b[0]["sup_K"])
