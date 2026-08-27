@@ -73,15 +73,42 @@ def load_view(render_dir, uid, view, res):
     return rgb, a[3:4], c2w, K
 
 
-def build(render_dir, uids, res, in_res=224):
+def build(render_dir, uids, res, in_res=224, n_input=1, normalize_cams=False):
+    """n_input: girdi olarak kullanilacak KANONIK gorunum sayisi (1..4).
+
+    NEDEN PARAMETRE (2026-08-27): projenin hedefi "kullanici 1 foto YA DA
+    4 kanonik aci verir". Egitim gercekten 1-4 arasi rastgele gorunum
+    kullaniyor (dataset.py: rng.randint(1, hi)) ama BUGUNE KADAR HER
+    DEGERLENDIRME TEK GORUNUMLE yapildi -- yani vaat edilen iki moddan biri
+    hic olculmedi. 4 gorunum 1'den KOTU bile olabilir (kamera ozelliklerinin
+    fuzyonu bozuksa); olcmeden bilinmez.
+    """
     data = []
     for u in uids:
-        i_rgb, _, i_c2w, i_K = load_view(render_dir, u, INPUT_VIEW, in_res)
-        rec = {"uid": u,
-               "in_img": i_rgb[None].to(DEV), "in_c2w": i_c2w[None].to(DEV),
-               "in_K": i_K[None].to(DEV)}
+        with io.open(f"{render_dir}/{u}/meta.json", encoding="utf-8") as f:
+            canon = list(json.load(f).get("canonical_indices") or [0, 1, 2, 3])
+        sel = canon[:max(1, min(n_input, len(canon)))]
+        imgs, c2ws, Ks = [], [], []
+        for vi in sel:
+            a, _, c, k = load_view(render_dir, u, vi, in_res)
+            imgs.append(a); c2ws.append(c); Ks.append(k)
+        in_c2w = torch.stack(c2ws)
+        tgt = {}
         for name, vi in (("girdi", INPUT_VIEW), ("yeni", NOVEL_VIEW)):
-            g, al, c2w, K = load_view(render_dir, u, vi, res)
+            tgt[name] = load_view(render_dir, u, vi, res)
+        if normalize_cams:
+            # Model kanoniklestirilmis kameralarla egitildiyse degerlendirme de
+            # AYNI donusumden gecmeli; yoksa dagitim disi kamera gomulmesi.
+            ref = in_c2w[0].clone()
+            in_c2w = cameras.canonicalize(ref, in_c2w)
+            for name in tgt:
+                g, al, c2w, K = tgt[name]
+                tgt[name] = (g, al, cameras.canonicalize(ref, c2w[None])[0], K)
+        rec = {"uid": u,
+               "in_img": torch.stack(imgs).to(DEV),
+               "in_c2w": in_c2w.to(DEV),
+               "in_K": torch.stack(Ks).to(DEV)}
+        for name, (g, al, c2w, K) in tgt.items():
             rec[f"gt_{name}"] = g.to(DEV)
             rec[f"al_{name}"] = al.to(DEV)
             rec[f"c2w_{name}"] = c2w.to(DEV)
@@ -189,7 +216,9 @@ def student_triplanes(model, data, amp=False):
 def neighbor_baseline(data, view):
     """RAKIP: her obje icin, GIRDI goruntusu en cok benzeyen BASKA objenin
     hedef-gorunum GT'si. 'Tani ve getir' stratejisinin ta kendisi."""
-    X = torch.stack([F.interpolate(d["in_img"], size=(32, 32), mode="bilinear",
+    # RAKIP baseline'i DAIMA ilk (kanonik on) gorunumden hesaplanir ki
+    # n_input degisince baseline degismesin -- kollar karsilastirilabilir kalsin.
+    X = torch.stack([F.interpolate(d["in_img"][:1], size=(32, 32), mode="bilinear",
                                    align_corners=False)[0] for d in data])
     D = ((X[:, None] - X[None]) ** 2).mean((2, 3, 4))
     D.fill_diagonal_(float("inf"))
@@ -211,6 +240,10 @@ def main():
     ap.add_argument("--n_obj", type=int, default=128)
     ap.add_argument("--res", type=int, default=128)
     ap.add_argument("--in_res", type=int, default=224)
+    ap.add_argument("--normalize_cams", action="store_true",
+                    help="model --normalize_cams ile egitildiyse SART")
+    ap.add_argument("--n_input", type=int, default=1,
+                    help="girdi olarak kac KANONIK gorunum (1=tek foto, 4=dort aci)")
     ap.add_argument("--amp", action="store_true")
     ap.add_argument("--no_teacher", action="store_true")
     ap.add_argument("--no_clip", action="store_true")
@@ -224,7 +257,7 @@ def main():
     # ---- uid secimi: ogretmen bankasi varsa ONUN sirasi baglayicidir
     tk = None
     if not a.no_teacher and os.path.isfile(a.teacher):
-        tk = torch.load(a.teacher, map_location="cpu")
+        tk = torch.load(a.teacher, map_location="cpu", weights_only=False)
     if a.uids_file:
         uids = json.load(io.open(a.uids_file, encoding="utf-8"))[:a.n_obj]
         tidx = None
@@ -235,19 +268,20 @@ def main():
         tl = json.load(io.open(a.train_list, encoding="utf-8"))
         uids = tl[a.split][:a.n_obj]
         tidx = None
-    print(f"degerlendirme: {len(uids)} obje | res {a.res} | girdi gorunum "
-          f"{INPUT_VIEW} | yeni gorunum {NOVEL_VIEW}", flush=True)
+    print(f"degerlendirme: {len(uids)} obje | res {a.res} | GIRDI GORUNUM SAYISI "
+          f"{a.n_input} | yeni gorunum {NOVEL_VIEW}", flush=True)
 
     model = LRM(n_samples=defaults.N_SAMPLES, bound=a.bound,
                 density_bias=a.density_bias).to(DEV).eval()
-    ck = torch.load(a.ckpt, map_location="cpu")
+    ck = torch.load(a.ckpt, map_location="cpu", weights_only=False)
     sd = ck.get("model", ck)
     missing = model.load_state_dict(sd, strict=False)
     print(f"  ckpt: {a.ckpt} (adim {ck.get('step','?')}) "
           f"eksik={len(missing.missing_keys)} fazla={len(missing.unexpected_keys)}",
           flush=True)
 
-    data = build(a.renders_dir, uids, a.res, a.in_res)
+    data = build(a.renders_dir, uids, a.res, a.in_res, a.n_input,
+                 normalize_cams=a.normalize_cams)
     M = Metrics(use_clip=not a.no_clip)
 
     tp_student = student_triplanes(model, data, amp=a.amp)

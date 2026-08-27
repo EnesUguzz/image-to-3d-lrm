@@ -418,6 +418,100 @@ Tam liste + gece koşan deneyler: **`docs/egitim-oncesi-netlestirme-plani.md`**.
   dizini okuyordu, yani A kolunun tekrarıydı. Aynı hata daha önce EEVEE/Cycles
   karşılaştırmasında uid üzerinden yapılmıştı (uid kamera açılarını seed'ler).
 
+## 🚦 KOŞU ÖNCESİ KONTROL — ZORUNLU
+
+> **Bu bölüm 2026-08-27'de kullanıcı talebiyle eklendi.** Sebep: art arda yapılan
+> yapılandırma hataları saatler kaybettirdi. Kural basit: **uzun bir işi
+> başlatmadan önce ne koşacağını fiilen oku.** "O bayrağı ben vermedim" bir
+> savunma değil — varsayılanlar da senin sorumluluğun.
+
+**15 dakikadan uzun sürecek HİÇBİR koşu, önce bu kontrol yapılmadan başlatılmaz.**
+
+```bash
+python scripts/train_lrm.py <TAM KOMUT> --dry_run     # 10 saniye
+```
+
+`--dry_run` ETKİN konfigürasyonu basar ve çıkar. Satır satır niyetle karşılaştır.
+Otomatik uyarı verdiği tuzaklar (üçü de fiilen yaşandı):
+
+- `teacher_subset > 0` → ortak öğretmen fazı açık (Blok 2'de terk edildi)
+- `warmup > 0.2 × steps` → kısa kolda warmup koşunun yarısı
+- obje başına maruziyet < 40 → yetersiz eğitimi tarife farkı sanma riski
+
+**Diğer koşu tipleri için aynı disiplin:**
+
+| kontrol | neden (fiilen yaşandı) |
+|---|---|
+| uid dosyası doğru split'ten mi? | `bench_uids_1024.json` eski split'ten; 97 val + 39 test objesi içeriyordu → sızıntı. Artık `train_lrm` reddediyor. |
+| A/B kollarında tek değişken gerçekten tek mi? | İki kez sessizce aynı/farklı veri okundu (`--render_dir` verilmedi; uid kamera açılarını seed'liyor) |
+| çıktı yolu bir öncekini ezer mi? | 16.000 adımlık checkpoint 40 adımlık duman testiyle ezildi → `--ckpt_dir` + `--tag` kullan |
+| metrik kalibre mi? | `rel` üzerine eşik yazıldı, kalibre değildi → `docs/metrik-sartnamesi.md` §5 |
+
+**Kod yamalarken:** her `str.replace` için `assert old in s`. Eşleşmeyen replace
+**hata vermez, sessizce hiçbir şey yapmaz** — bu da bir kez yaşandı (`--dry_run`
+imzası eklenmedi, koşu `TypeError` ile düştü). Yazmadan önce `ast.parse`.
+
+**Bir koşu bittiğinde:** sonucu raporlamadan önce sayının makul olup olmadığına
+bak. "Öğretmen F@1% = 0.000" imkânsızdı ve teşhis edilince eşik seçimi hatası
+çıktı. Makul olmayan sayı raporlanmaz, teşhis edilir.
+
+### 2026-08-27 — tam eğitim öncesi son blok
+
+**▶ Başlatma talimatı: [`docs/TAM-EGITIM-BASLATMA.md`](docs/TAM-EGITIM-BASLATMA.md)**
+Komut, her bayrağın gerekçesi, nöbet tablosu (ne görünce kes), bitiş eval'leri.
+
+**Sıfırdan render kaybı ölçekte ÇALIŞMIYOR — ikinci kez ölçüldü.**
+1024 objede, referans tarifenin tamamıyla (normalize_cams, unfreeze 4, bf16,
+bölge kırpma): kol A 6000 adımda **8,8 dB**'de kaldı (taban 17,36!). Önizleme
+teşhisi koydu: model `bound` küpünü dolduran yarı-saydam kütle basıyor,
+`acc≈0.50` sabit. Kol D (`mask_fg_weight 0`) ters yöne, boş sahneye çöktü.
+→ **3 aşamalı zincir zorunlu**, tercih değil.
+
+**Öğretmen 12k objeye ÇIKAMAZ (sert VRAM sınırı).** `fit_teacher.py:65` tüm
+triplane'leri tek GPU parametresinde tutuyor: obje başına 1,57 MB ⇒ 12.320 obje
+= 19,4 GB (Adam'la 3×). Tavan ~2.000 obje. **Bu yüzden 3. aşama (render ince
+ayarı) tüm veriyi gören TEK aşama.**
+
+**3. aşama kararı: KALIYOR.** `distilled_v2` ↔ `C2`, 128 obje:
+in-sample PSNR 24,33 → 22,00 (kötü), held-out IoU 0,540 → **0,574**,
+top-1 %30,5 → **%33,6**, CLIP +0,015, LPIPS −0,013 (iyi). C2'nin 3. aşaması
+**hiç yeni veri görmedi** (distilasyonla aynı 1024 obje); tam koşuda
+12.320'nin **11.296'sı (%92) yeni**.
+
+**Yüzeydeki "köpük" — kaynağı ölçüldü, mimari DEĞİŞMİYOR.**
+`nerf.py` sadece triplane özelliği alıyor (konum kodlaması yok) + `grid_sample`
+bilineer 64² ⇒ alan bir hücre altında yapı taşıyamaz. Spektrum: gücün %99,9'u
+**0,97 hücre**, %95'i 3,5 hücre (~0,06 dünya birimi) üstünde. Öğretmende de,
+öğrencide de aynı ⇒ veri/transformer suçlu değil.
+Triplane 128²: +%5 süre ama %95 bandı sadece **−%6** (PSNR +0,5 dB) **ve
+öğretmen bankasını geçersiz kılar** → reddedildi. Çözüm son-işlem:
+`extract_mesh.py --smooth N` (Taubin, hacim korumalı).
+
+**İki Faz C hatası — sadece çıktıya bakarak bulundu:**
+1. **glTF Y-up dönüşümü yoktu** (dünyamız Z-up) → three.js'te her obje yan yatardı.
+2. **Renkler sRGB→lineer çevrilmiyordu** → glTF ikinci kez aydınlatıp yıkıyordu.
+
+**`--resume` KIRIKTI.** PyTorch 2.6+ `torch.load` varsayılanı `weights_only=True`;
+künyedeki `torch.__version__` bir *TorchVersion nesnesi* olduğu için künyeli hiçbir
+checkpoint okunamıyordu (17 çağrı noktası). Kök neden düzeltildi (künye alanları
+düz string) + uçtan uca test edildi.
+
+**Yeni güvenlik ağları:**
+- Checkpoint **render künyesi** taşıyor (`density_bias`/`bound`); `--init_from`'da
+  uyuşmazsa koşu **başlamıyor**. (Kol C bu hatayla 24 → 16,3 dB vermişti.)
+- `--snapshot_every`: `last_*.pt` eziliyor; kalite ortada tepe yapıp düşerse
+  (C2 tam bunu yaptı) en iyi model kaybolmasın.
+- Önizlemeler **koşu başına klasöre**; önceden farklı koşular birbirini eziyordu.
+- `--mask_fg_weight` RGB'nin `fg_weight`'inden ayrıldı.
+
+**⚠️ Ölçüm dersi:** `eval_suite` varsayılanı `--split train` (**in-sample**),
+`train_lrm`'in val probe'u **held-out**. Aynı checkpoint 24,33 ↔ 16,87 dB.
+Bu ikisi karşılaştırılamaz. Dünkü "ölçek eğrisi düz" sonucu da in-sample'dı,
+yani genelleme hakkında hiçbir şey söylemiyor.
+
+**Testler: 137 → 155.** Silinen yetim scriptler: `diag_attn_cond`,
+`diag_dino_color`, `diag_train_vs_val` (hepsi `eval_suite --split` ile ikame).
+
 ## 🛠️ Çalışma Kuralları
 
 - Yaratıcı/kurulum işine başlamadan **superpowers skill'lerini** kullan

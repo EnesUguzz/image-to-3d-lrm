@@ -9,11 +9,18 @@ import torch.nn.functional as F
 
 class LRMLoss(nn.Module):
     def __init__(self, w_mse=1.0, w_lpips=1.0, w_mask=1.0, use_lpips=True,
-                 fg_weight=5.0):
+                 fg_weight=5.0, mask_fg_weight=None):
         super().__init__()
         self.w_mse, self.w_lpips, self.w_mask = w_mse, w_lpips, w_mask
         self.use_lpips = use_lpips
         self.fg_weight = fg_weight
+        # mask_fg_weight=None => eski davranis (RGB ile ayni agirlik). AYRI OLMASININ
+        # SEBEBI (2026-08-27, olculdu): fg_weight TAM KARE denetimi icin eklenmisti,
+        # orada arka plan alanca eziciydi. Bolge kirpmasiyla (fg_bias=0.75, 64^2 yama)
+        # arka plan zaten azinlikta; ayni duzeltme cift sayilinca 'bosluk oy' sinyali
+        # mask kaybinin sadece ~%14'une dusuyor => model bound kupunu doldurup oturuyor
+        # (kol A: 6000 adim boyunca acc~0.50, mask 0.45'te cakili, PSNR 8.8 dB).
+        self.mask_fg_weight = fg_weight if mask_fg_weight is None else mask_fg_weight
         self._lpips = None  # lazy
 
     def _lpips_fn(self, device):
@@ -33,7 +40,9 @@ class LRMLoss(nn.Module):
         w_rgb = w.expand_as(pred_rgb)
         mse = (w_rgb * (pred_rgb - gt_rgb) ** 2).sum() / w_rgb.sum().clamp_min(1e-8)
         parts["mse"] = mse.detach()
-        mask = (w * (pred_acc - gt_alpha).abs()).sum() / w.sum().clamp_min(1e-8)
+        wm = (w if self.mask_fg_weight == self.fg_weight
+              else 1.0 + self.mask_fg_weight * gt_alpha)
+        mask = (wm * (pred_acc - gt_alpha).abs()).sum() / wm.sum().clamp_min(1e-8)
         parts["mask"] = mask.detach()
         total = self.w_mse * mse + self.w_mask * mask
         if self.use_lpips and self.w_lpips > 0:

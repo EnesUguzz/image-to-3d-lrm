@@ -230,10 +230,10 @@ def main():
     model = LRM(n_samples=a.n_samples, density_bias=a.density_bias,
                 noise_std=a.noise_std, bound=a.bound, **kw).to(DEV)
     if a.init_from:
-        model.load_state_dict(torch.load(a.init_from, map_location="cpu")["model"])
+        model.load_state_dict(torch.load(a.init_from, map_location="cpu", weights_only=False)["model"])
         print(f"  baslangic agirliklari: {a.init_from}", flush=True)
     if a.init_nerf:
-        model.nerf.load_state_dict(torch.load(a.init_nerf, map_location="cpu")["nerf"])
+        model.nerf.load_state_dict(torch.load(a.init_nerf, map_location="cpu", weights_only=False)["nerf"])
         print(f"  oracle NeRF yuklendi: {a.init_nerf}", flush=True)
     if a.train_encoder:
         for p in model.encoder.model.parameters():

@@ -32,7 +32,7 @@ def main():
                     render_res=RES, n_sup=4, augment=False)
     uids = ds.uids[:12]
     m = LRM(n_samples=48).to(DEV).eval()
-    st = torch.load(CKPT, map_location="cpu"); m.load_state_dict(st["model"])
+    st = torch.load(CKPT, map_location="cpu", weights_only=False); m.load_state_dict(st["model"])
     print(f"ckpt step {st['step']} | {len(uids)} train objesi | girdi view {IN_VIEW}, hedef view {SUP_VIEW}")
 
     preds, gts = [], []

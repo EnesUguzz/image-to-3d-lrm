@@ -45,7 +45,7 @@ def setup_logging():
 
 
 def save_checkpoint(path, model, opt, scheduler, step, teacher=None, opt_t=None,
-                    force=False, stamp=None):
+                    force=False, stamp=None, render_cfg=None):
     """Checkpoint yazar. Yazdiysa True, GERI CEVIRDIYSE False doner.
 
     GERI CEVIRME KURALI -- gercekten yasandi (2026-08-26): 40 adimlik bir duman
@@ -67,6 +67,12 @@ def save_checkpoint(path, model, opt, scheduler, step, teacher=None, opt_t=None,
             return False
     ck = {"model": model.state_dict(), "opt": opt.state_dict(),
           "sched": scheduler.state_dict(), "step": step}
+    # RENDER KUNYESI (2026-08-27, fiilen yasandi): NeRF MLP'nin agirliklari
+    # density_bias/bound VARSAYIMIYLA oturur. Baska bir bias ile render edilirse
+    # ham yogunluga sabit offset biner ve geometri sessizce sislenir -- kol C
+    # bu yuzden 24 dB yerine 16.3 dB verdi. Artik kunye checkpoint'te tasiniyor.
+    if render_cfg is not None:
+        ck['render_cfg'] = dict(render_cfg)
     if stamp is not None:
         ck["stamp"] = stamp
     if teacher is not None:   # resume'da ogretmen sifirdan baslamasin
@@ -77,14 +83,15 @@ def save_checkpoint(path, model, opt, scheduler, step, teacher=None, opt_t=None,
 
 
 def load_checkpoint(path, model, opt, scheduler):
-    ck = torch.load(path, map_location="cpu")
+    ck = torch.load(path, map_location="cpu", weights_only=False)
     model.load_state_dict(ck["model"])
     opt.load_state_dict(ck["opt"])
     scheduler.load_state_dict(ck["sched"])
     return ck["step"], ck.get("teacher"), ck.get("opt_t")
 
 
-def build_val_probe(renders_dir, uids, render_res, input_res=224, device="cuda"):
+def build_val_probe(renders_dir, uids, render_res, input_res=224, device="cuda",
+                    normalize_cams=False):
     """SABIT val problemi: her obje icin girdi = kanonik[0] (on, az 0 el 20),
     hedef = kanonik[1] ve [2] (yan + arka). Kanonik acilar TUM objelerde ayni
     oldugu icin metrik objeler arasi karsilastirilabilir; supervision gorunumleri
@@ -116,11 +123,18 @@ def build_val_probe(renders_dir, uids, render_res, input_res=224, device="cuda")
             tg_rgb.append(r[:3] * r[3:4] + (1.0 - r[3:4]))      # beyaz kompozit hedef
             tg_alpha.append(r[3:4])                             # siluet IoU icin
             tg_c2w.append(c2w(i)); tg_K.append(K_for(i, render_res))
+        in_c2w = c2w(i_in)[None]
+        tgt_c2w = torch.stack(tg_c2w)
+        if normalize_cams:
+            # Egitimdekiyle AYNI donusum: referans = (tek) girdi kamerasi.
+            ref = in_c2w[0]
+            in_c2w = cameras.canonicalize(ref, in_c2w)
+            tgt_c2w = cameras.canonicalize(ref, tgt_c2w)
         probe.append(dict(
             uid=uid,
-            ii=img[None].to(device), ic=c2w(i_in)[None].to(device),
+            ii=img[None].to(device), ic=in_c2w.to(device),
             ik=K_for(i_in, input_res)[None].to(device),
-            tc=torch.stack(tg_c2w).to(device), tk=torch.stack(tg_K).to(device),
+            tc=tgt_c2w.to(device), tk=torch.stack(tg_K).to(device),
             gt=torch.stack(tg_rgb).to(device),
             ga=torch.stack(tg_alpha).to(device)))
     return probe
@@ -220,7 +234,7 @@ def save_val_grid(model, dataset, uids, device, path, render_res):
 
 
 def train(train_list, renders_dir, steps=40000, micro_batch=2, grad_accum=4,
-          render_res=128, n_sup=3, lr=4e-4, warmup=500, ckpt_every=2000,
+          render_res=128, n_sup=3, lr=4e-4, warmup=3000, ckpt_every=2000,
           val_every=1000, resume=False, device="cuda", amp=True, grad_ckpt=False,
           n_samples=defaults.N_SAMPLES, w_lpips=0.25, w_tv=5e-4,
           low_res=64, coarse_frac=0.0,
@@ -229,8 +243,32 @@ def train(train_list, renders_dir, steps=40000, micro_batch=2, grad_accum=4,
           train_encoder=False, unfreeze_last=0, val_n=64, max_input=None,
           collapse_after=None, region=64, render_low=64, render_high=192,
           fg_bias=0.75, workers=6, density_bias=0.0, noise_std=0.0,
-          bound=defaults.BOUND):
+          mask_fg_weight=None,
+          bound=defaults.BOUND, normalize_cams=False, enc_lr_scale=0.1,
+          ckpt_dir=None, uids_file="", n_obj=0, tag="", init_from="",
+          force_cfg=False,
+          snapshot_every=0,
+          dry_run=False):
     logger = setup_logging()
+    # ETKIN KONFIGURASYON: uzun kosuyu baslatmadan once GORULMESI gereken sey.
+    # Bu satir olmadigi icin ortak-ogretmen fazi (teacher_subset=512) fark
+    # edilmeden acik kaldi ve 6000 adimlik bir kosunun yarisi bosa gitti;
+    # warmup=3000 de kosunun yarisini warmup yapiyordu. Ikisi de VARSAYILAN
+    # deger yuzunden -- yani 'ben o bayragi vermedim' hic savunma degil.
+    _eff = dict(steps=steps, micro_batch=micro_batch, grad_accum=grad_accum,
+                obje_basina_maruziyet=None, warmup=warmup,
+                warmup_orani=round(warmup / max(steps, 1), 3),
+                lr=lr, enc_lr_scale=enc_lr_scale, w_lpips=w_lpips, w_tv=w_tv,
+                teacher_subset=teacher_subset, teacher_off=teacher_off,
+                normalize_cams=normalize_cams, train_encoder=train_encoder,
+                unfreeze_last=unfreeze_last, density_bias=density_bias,
+                noise_std=noise_std, bound=bound, region=region,
+                n_sup=n_sup, render_res=render_res, amp=amp,
+                fg_bias=fg_bias, snapshot_every=snapshot_every,
+                mask_fg_weight=('RGB ile ayni (5.0)' if mask_fg_weight is None
+                                else mask_fg_weight),
+                augment=augment, init_from=init_from or '-',
+                uids_file=uids_file or '-', n_obj=n_obj)
     # Egitilmemis model TANIMI GEREGI 'ortalama obje' cokusundedir; alarmi
     # basindan calarsak alarm yorgunlugu olur ve gercek cokus fark edilmez.
     collapse_after = 2 * warmup if collapse_after is None else collapse_after
@@ -241,7 +279,7 @@ def train(train_list, renders_dir, steps=40000, micro_batch=2, grad_accum=4,
     torch.backends.cudnn.benchmark = True
     train_ds = LRMDataset(train_list, renders_dir, split="train",
                           render_res=render_res, n_sup=n_sup, augment=augment,
-                          max_input=max_input,
+                          max_input=max_input, normalize_cams=normalize_cams,
                           # BOLGE KIRPMA (OpenLRM/TripoSR): isin butcesi region^2'de
                           # sabit, ama yamadaki obje orani cok yuksek. Sabit
                           # coarse-to-fine faz gecisinin yerine gecer.
@@ -253,12 +291,71 @@ def train(train_list, renders_dir, steps=40000, micro_batch=2, grad_accum=4,
                           deterministic=False)
     # VAL KIRPILMAZ: metrik tum gecmisle karsilastirilabilir kalmali
     # (sabit kamera, tam kare, sabit cozunurluk).
+    if uids_file:
+        # SABIT ALT KUME: A/B kollarinin AYNI objeleri gormesi sart. 32-obje
+        # tezgahinin hangi 32'ye asiri duyarli oldugu olculmustu (top-1
+        # %75 / %19 / %3). bench_uids_* dosyalari ic ice (32 C 250 C 1024).
+        with open(uids_file, encoding="utf-8") as _f:
+            _raw = json.load(_f)
+        _sel = _raw["uids"] if isinstance(_raw, dict) else list(_raw)
+        # SIZINTI KAPISI (2026-08-27): bench_uids_1024.json ESKI split'ten
+        # uretilmisti; train_list_v2 ile 97 val + 39 test objesi ortakti.
+        # Sessizce kirpsaydik val/test egitime sizardi ve tum genelleme
+        # olcumleri iyimser cikardi. Artik acikca reddediliyor.
+        with open(train_list, encoding="utf-8") as _f:
+            _tl = json.load(_f)
+        _leak = set(_sel) & (set(_tl.get("val", [])) | set(_tl.get("test", [])))
+        assert not _leak, (
+            "%s: %d uid %s icindeki val/test bolumunde -- SIZINTI. "
+            "Bu bench dosyasi baska bir split icin uretilmis." % (
+                uids_file, len(_leak), train_list))
+        _have = set(train_ds.uids)
+        _sel = [u for u in _sel if u in _have]
+        if n_obj:
+            _sel = _sel[:n_obj]
+        assert _sel, uids_file + ": train split ile kesisim bos"
+        train_ds.uids = _sel
+    elif n_obj:
+        train_ds.uids = train_ds.uids[:n_obj]
+    _eff["obje_basina_maruziyet"] = round(
+        steps * micro_batch * grad_accum / max(len(train_ds.uids), 1), 1)
+    logger.info("--- ETKIN KONFIGURASYON ---")
+    for _k in sorted(_eff):
+        logger.info("    %-24s = %s" % (_k, _eff[_k]))
+    # Sessiz tuzaklar: gecmiste FIILEN yasananlar.
+    if teacher_subset and w_distill:
+        logger.warning("    !! ORTAK OGRETMEN FAZI ACIK (teacher_subset=%d). Blok 2'de"
+                       " bu yaklasim terk edildi (olcege bagli, 2635'te kirildi);"
+                       " yerine fit_teacher->distill_lrm zinciri geldi."
+                       " Istemiyorsan --teacher_subset 0." % teacher_subset)
+    if warmup > 0.2 * steps:
+        logger.warning("    !! WARMUP KOSUNUN %%%.0f'i (%d/%d). Referansin 3000'i cok"
+                       " daha uzun bir program icin; kisa kollarda oransal olmali."
+                       % (100 * warmup / steps, warmup, steps))
+    if _eff["obje_basina_maruziyet"] < 40:
+        logger.warning("    !! obje basina sadece %.1f maruziyet -- dogrulanmis"
+                       " deneylerde 150 gerekmisti; sonuc yetersiz egitimi"
+                       " tarife farki sanmaya yol acabilir."
+                       % _eff["obje_basina_maruziyet"])
+    if dry_run:
+        logger.info("--- DRY RUN: kosu BASLATILMADI ---")
+        return
+    logger.info("egitim kumesi: %d obje%s" % (
+        len(train_ds.uids), (" (kaynak " + uids_file + ")") if uids_file else ""))
+
     val_ds = LRMDataset(train_list, renders_dir, split="val",
-                        render_res=render_res, n_sup=n_sup, augment=False)
+                        render_res=render_res, n_sup=n_sup, augment=False,
+                        normalize_cams=normalize_cams)
     val_uids = val_ds.uids[:6]
     # Sayisal val: sabit N obje, sabit kanonik kameralar, tek girdi.
+    # KRITIK: model kanoniklestirilmis kameralarla egitiliyorsa val problemi de
+    # ayni donusumden gecmeli; yoksa model dagitim disi kamera gomulmesi gorur.
     val_probe = build_val_probe(renders_dir, val_ds.uids[:val_n], render_res,
-                                device=device)
+                                device=device, normalize_cams=normalize_cams)
+    # Onizlemeler KOSU BASINA ayri klasore: duz klasorde farkli kosular
+    # ayni adim numarasinda birbirini eziyordu (kanit kaybi).
+    _prev_dir = os.path.join(PREVIEW_DIR, tag or "kosu")
+    os.makedirs(_prev_dir, exist_ok=True)
     val_jsonl = os.path.join(LOG_DIR, "val_metrics.jsonl")
     # Veri yukleme senkronken ornek basina ~25 ms CPU maliyeti vardi; hizlanma
     # sonrasi adimin ~%45'i olurdu. Worker'lar bunu GPU hesabiyla ortusturur.
@@ -287,6 +384,38 @@ def train(train_list, renders_dir, steps=40000, micro_batch=2, grad_accum=4,
     model = LRM(n_samples=n_samples, cross_attn=cross_attn,
                 density_bias=density_bias, noise_std=noise_std,
                 bound=bound).to(device)
+    _cfg_kunye = {'density_bias': density_bias, 'bound': bound}
+    if init_from:
+        # 3 ASAMALI ZINCIR (fit_teacher -> distill_lrm -> train_lrm) icin:
+        # render kaybina SIFIRDAN degil, distile agirliklardan basla.
+        # E1 deneyi asama 3'un calistigini gostermisti (24.10 -> 24.99 dB).
+        _ck = torch.load(init_from, map_location="cpu", weights_only=False)
+        _cur = {"density_bias": density_bias, "bound": bound}
+        _saved = _ck.get("render_cfg")
+        if _saved is None:
+            # Eski format (fit_teacher/distill_lrm kunye yazmiyordu). Zincirin
+            # FIILEN kullandigi degerler: TriplaneNeRF(in_dim=96, hidden=64) =>
+            # density_bias 0.0 (fit_teacher.py:66), bound defaults.BOUND.
+            _saved = {"density_bias": 0.0, "bound": defaults.BOUND}
+            logger.warning("    !! %s KUNYESIZ (eski format); zincirin fiili"
+                           " varsayilani kabul ediliyor: %s", init_from, _saved)
+        _fark = {k: (_saved.get(k), v) for k, v in _cur.items()
+                 if _saved.get(k) is not None
+                 and abs(float(_saved[k]) - float(v)) > 1e-9}
+        if _fark and not force_cfg:
+            _sat = ["  %s: checkpoint=%s  simdiki=%s" % (k, a_, b_)
+                    for k, (a_, b_) in _fark.items()]
+            raise SystemExit("\n".join([
+                "HATA: --init_from checkpoint'i FARKLI bir render konfigurasyonuyla",
+                "uretilmis; NeRF MLP agirliklari o varsayimla oturdu."] + _sat + [
+                "Bias/bound degistirmek ham yogunluga sabit offset bindirir ve",
+                "distile geometriyi sessizce sisler (kol C: 24 -> 16.3 dB).",
+                "Ya degerleri esitle ya da bilerek istiyorsan --force_cfg ver."]))
+        _sd = _ck.get("model", _ck)
+        _res = model.load_state_dict(_sd, strict=False)
+        logger.info("baslangic agirliklari: %s (adim %s) eksik=%d fazla=%d" % (
+            init_from, _ck.get("step", "?"), len(_res.missing_keys),
+            len(_res.unexpected_keys)))
     if grad_ckpt:  # VRAM bol oldugu icin varsayilan kapali (hiz icin)
         model.transformer.enable_checkpointing()
     # LPIPS agirligi 0.25 (OLCULDU, 32-obje tezgahi, ayni 2000 adimlik program):
@@ -311,7 +440,8 @@ def train(train_list, renders_dir, steps=40000, micro_batch=2, grad_accum=4,
         # encoder.forward @torch.no_grad ile sarili; gradyan aksin diye ac
         model.encoder.forward = model.encoder.forward.__wrapped__.__get__(model.encoder)
 
-    loss_fn = LRMLoss(use_lpips=True, w_lpips=w_lpips).to(device)
+    loss_fn = LRMLoss(use_lpips=True, w_lpips=w_lpips,
+                      mask_fg_weight=mask_fg_weight).to(device)
     params = [p for p in model.parameters() if p.requires_grad]
     logger.info(f"egitilebilir parametre: {sum(p.numel() for p in params)/1e6:.1f}M "
                 f"| enc_train={train_encoder or unfreeze_last} | val_probe={len(val_probe)}")
@@ -328,7 +458,16 @@ def train(train_list, renders_dir, steps=40000, micro_batch=2, grad_accum=4,
     _enc_snap = (runstamp.weight_snapshot(model.encoder, only_trainable=True)
                  if (train_encoder or unfreeze_last > 0) else None)
     _psnr_hist = []
-    opt = torch.optim.AdamW(params, lr=lr, weight_decay=0.05, betas=(0.9, 0.95))
+    # ENCODER ICIN DUSUK LR (referans pratigi): onceden egitilmis DINOv2'yi
+    # govdeyle ayni lr'de surmek temsili bozar. Ayri param grubu, lr*enc_lr_scale.
+    _enc_ids = {id(q) for q in model.encoder.parameters()}
+    _enc_p = [q for q in params if id(q) in _enc_ids]
+    _rest_p = [q for q in params if id(q) not in _enc_ids]
+    _groups = [{'params': _rest_p, 'lr': lr}]
+    if _enc_p:
+        _groups.append({'params': _enc_p, 'lr': lr * enc_lr_scale})
+        logger.info(f'encoder param grubu: {sum(q.numel() for q in _enc_p)/1e6:.1f}M @ lr*{enc_lr_scale} = {lr*enc_lr_scale:.2e}')
+    opt = torch.optim.AdamW(_groups, lr=lr, weight_decay=0.05, betas=(0.9, 0.95))
 
     def lr_lambda(s):
         if s < warmup:
@@ -339,7 +478,11 @@ def train(train_list, renders_dir, steps=40000, micro_batch=2, grad_accum=4,
 
     start_step = 0
     _resume_teacher = _resume_opt_t = None
-    last_ckpt = os.path.join(CKPT_DIR, "last.pt")
+    # A/B kollari birbirinin checkpointini EZMESIN diye ayri dizin/ad.
+    _cdir = ckpt_dir or CKPT_DIR
+    os.makedirs(_cdir, exist_ok=True)
+    _suffix = ("_" + tag) if tag else ""
+    last_ckpt = os.path.join(_cdir, "last" + _suffix + ".pt")
     if resume and os.path.isfile(last_ckpt):
         start_step, _resume_teacher, _resume_opt_t = load_checkpoint(
             last_ckpt, model, opt, scheduler)
@@ -359,7 +502,7 @@ def train(train_list, renders_dir, steps=40000, micro_batch=2, grad_accum=4,
     # calisiyordu. Onceden oturtulmus ogretmen bu sorunu kokten cozer.
     init_tp = None
     if teacher_init:
-        _ck_t = torch.load(teacher_init, map_location="cpu")
+        _ck_t = torch.load(teacher_init, map_location="cpu", weights_only=False)
         init_tp = _ck_t["triplanes"]
         # NeRF'i SADECE sifirdan baslarken yukle. Resume'da checkpoint'teki egitilmis
         # NeRF gecerlidir; burada uzerine yazmak saatlerce ilerlemeyi sessizce siler.
@@ -498,7 +641,7 @@ def train(train_list, renders_dir, steps=40000, micro_batch=2, grad_accum=4,
                         f"lr={scheduler.get_last_lr()[0]:.2e} {speed:.2f}it/s vram={vram:.1f}GB")
         if step > 0 and step % val_every == 0:
             save_val_grid(model, val_ds, val_uids, device,
-                          os.path.join(PREVIEW_DIR, f"val_{step:06d}.png"), render_res)
+                          os.path.join(_prev_dir, f"val_{step:06d}.png"), render_res)
             vm = val_metrics(model, val_probe, render_res, device,
                              psnr_history=_psnr_hist)
             if vm:
@@ -533,14 +676,24 @@ def train(train_list, renders_dir, steps=40000, micro_batch=2, grad_accum=4,
                     logger.info("  " + runstamp.format_delta(
                         runstamp.weight_delta(model.encoder, _enc_snap), "encoder"))
                 with open(val_jsonl, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(dict(step=step, stamp=_stamp["config_hash"],
+                    f.write(json.dumps(dict(step=step, tag=tag or "-",
+                                            stamp=_stamp["config_hash"],
                                             **vm)) + chr(10))
         if step > 0 and step % ckpt_every == 0:
             if save_checkpoint(last_ckpt, model, opt, scheduler, step,
                                teacher if opt_t is not None else None, opt_t,
-                               stamp=_stamp):
+                               stamp=_stamp, render_cfg=_cfg_kunye):
                 logger.info(f"checkpoint kaydedildi: {last_ckpt}")
-    save_checkpoint(last_ckpt, model, opt, scheduler, steps, stamp=_stamp)
+        # ARSIV: last_*.pt her seferinde EZILIYOR. Kalite ortada tepe yapip
+        # sonra bozulursa (C2: in-sample 24.33 -> 22.00) en iyi model geri
+        # getirilemez. Bu kayitlar ezilmez.
+        if snapshot_every and step > 0 and step % snapshot_every == 0:
+            _snap = os.path.join(os.path.dirname(last_ckpt) or ".",
+                                 "snap%s_step%06d.pt" % ("_" + tag if tag else "", step))
+            if save_checkpoint(_snap, model, opt, scheduler, step, None, None,
+                               stamp=_stamp, render_cfg=_cfg_kunye):
+                logger.info("ARSIV checkpoint: %s", _snap)
+    save_checkpoint(last_ckpt, model, opt, scheduler, steps, stamp=_stamp, render_cfg=_cfg_kunye)
     logger.info("egitim bitti")
 
 
@@ -584,6 +737,10 @@ if __name__ == "__main__":
                     help="ornek basina render cozunurlugu alt siniri (OpenLRM 64)")
     ap.add_argument("--render_high", type=int, default=192,
                     help="ornek basina render cozunurlugu ust siniri (OpenLRM 192)")
+    ap.add_argument("--mask_fg_weight", type=float, default=None,
+                    help="mask kaybinda on-plan agirligi (None=RGB ile ayni, 5.0). "
+                         "0.0 = tekdusze mask => arka planin BOS olmasi sinyali 3.5x "
+                         "guclenir. Kol A dolu-kup cokusunun panzehiri.")
     ap.add_argument("--fg_bias", type=float, default=0.75,
                     help="kirpmanin on plani kesme olasiligi (TripoSR tarzi)")
     ap.add_argument("--bound", type=float, default=defaults.BOUND,
@@ -619,6 +776,34 @@ if __name__ == "__main__":
                     help="ASAMA 1 ciktisi (scripts/fit_teacher.py). Onceden oturtulmus "
                          "ogretmen triplane'leri + NeRF. Olculdu: dongu icinde sifirdan "
                          "yetisen ogretmen ogrenciden kotu kaliyor.")
+    ap.add_argument("--dry_run", action="store_true",
+                    help="ETKIN konfigurasyonu yaz ve CIK. Uzun kosudan once "
+                         "niyetle karsilastirmak icin -- 10 saniye, saatler kurtarir.")
+    ap.add_argument("--snapshot_every", type=int, default=0,
+                    help="her N adimda EZILMEYEN arsiv checkpointi yaz. "
+                         "last_*.pt surekli ezildigi icin, kalite ortada tepe "
+                         "yapip bozulursa en iyi model kaybolur. 0 = kapali.")
+    ap.add_argument("--force_cfg", action="store_true",
+                    help="--init_from checkpointinin render kunyesi "
+                         "(density_bias/bound) simdikiyle uyusmasa bile devam et. "
+                         "BILEREK kullan.")
+    ap.add_argument("--init_from", default="",
+                    help="model agirliklarini bu checkpoint'ten baslat "
+                         "(distile checkpoint uzerinden render ince ayari)")
+    ap.add_argument("--ckpt_dir", default=None,
+                    help="A/B kollari birbirini ezmesin diye ayri checkpoint dizini")
+    ap.add_argument("--uids_file", default="",
+                    help="egitim kumesini sabit uid listesine kis (dataset/bench_uids_*.json)")
+    ap.add_argument("--n_obj", type=int, default=0,
+                    help="egitim kumesini ilk N objeye kis (0=hepsi)")
+    ap.add_argument("--tag", default="",
+                    help="checkpoint adina eklenir; kollar cakismasin")
+    ap.add_argument("--normalize_cams", action="store_true",
+                    help="LRM normalize_camera: dunyayi ilk girdi kamerasi kanonik "
+                         "poza gelecek sekilde dondur. Referansta ACIK, bizde hic "
+                         "kullanilmamisti (LRM'de PSNR 15.3->19.0).")
+    ap.add_argument("--enc_lr_scale", type=float, default=0.1,
+                    help="encoder param grubunun lr carpani (referans: lr/10)")
     ap.add_argument("--train_encoder", action="store_true",
                     help="DINOv2'nin TAMAMINI egit")
     ap.add_argument("--unfreeze_last", type=int, default=0,
@@ -647,4 +832,9 @@ if __name__ == "__main__":
           collapse_after=a.collapse_after, region=a.region,
           render_low=a.render_low, render_high=a.render_high,
           fg_bias=a.fg_bias, workers=a.workers,
-          density_bias=a.density_bias, noise_std=a.noise_std, bound=a.bound)
+          mask_fg_weight=a.mask_fg_weight,
+          density_bias=a.density_bias, noise_std=a.noise_std, bound=a.bound,
+          normalize_cams=a.normalize_cams, enc_lr_scale=a.enc_lr_scale,
+          ckpt_dir=a.ckpt_dir, uids_file=a.uids_file, n_obj=a.n_obj, tag=a.tag,
+          init_from=a.init_from, force_cfg=a.force_cfg,
+          snapshot_every=a.snapshot_every, dry_run=a.dry_run)

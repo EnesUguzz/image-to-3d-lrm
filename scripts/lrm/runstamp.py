@@ -38,9 +38,12 @@ def run_stamp(cfg=None):
     """Sonuc json'una gomulecek kunye."""
     try:
         import torch
-        tv = torch.__version__
+        # str() SART: torch.__version__ bir TorchVersion NESNESI, str degil.
+        # Kunyeye oldugu gibi konursa checkpoint torch.load(weights_only=True)
+        # ile okunamaz (PyTorch 2.6+ varsayilani) => --resume/--init_from duser.
+        tv = str(torch.__version__)
         gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
-        cuda = getattr(torch.version, "cuda", None)
+        cuda = str(getattr(torch.version, "cuda", None) or "")
     except Exception:
         tv, gpu, cuda = "", "", None
     return {

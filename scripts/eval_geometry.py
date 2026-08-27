@@ -46,7 +46,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lrm import cameras, defaults, runstamp
 from lrm.model import LRM
-from extract_mesh import density_grid, to_mesh, clean, silhouette_iou
+from extract_mesh import density_grid, to_mesh, clean, silhouette_iou, report
 
 DEV = "cuda"
 BLENDER = r"C:\Program Files\Blender Foundation\Blender 4.4\blender.exe"
@@ -184,10 +184,10 @@ def main():
     print("uid->glb haritasi yukleniyor...", flush=True)
     table = json.load(gzip.open(PATHS_GZ, "rt", encoding="utf-8"))
 
-    tk = torch.load(a.teacher, map_location="cpu")
+    tk = torch.load(a.teacher, map_location="cpu", weights_only=False)
     uids = tk["uids"][:a.n_obj]
     model = LRM(n_samples=defaults.N_SAMPLES, bound=a.bound).to(DEV).eval()
-    ck = torch.load(a.ckpt, map_location="cpu")
+    ck = torch.load(a.ckpt, map_location="cpu", weights_only=False)
     model.load_state_dict(ck.get("model", ck), strict=False)
     print(f"geometri: {len(uids)} obje | izgara {a.grid}^3 | {a.n_pts} nokta "
           f"| ckpt adim {ck.get('step','?')}", flush=True)
@@ -262,6 +262,16 @@ def main():
                 continue
             row[f"{name}_esik"] = lvl
             row[f"{name}_siluet_iou"] = sil
+            # TOPOLOJI SAGLIGI: Faz C .glb uretecek, mesh kapali ve makul olmali.
+            # Daha once olculdugunde Euler = -92 (47 tunel) cikmisti -- "putur
+            # putur" gorunum render artefakti degil GERCEK geometriydi.
+            rep = report(pm)
+            row[f"{name}_watertight"] = float(bool(rep["watertight"]))
+            row[f"{name}_bilesen"] = float(rep["components"])
+            try:
+                row[f"{name}_euler"] = float(pm.euler_number)
+            except Exception:
+                pass
             P, Pn = sample_surface(pm, a.n_pts)
             for k, v in geom_metrics(P, Pn, G, Gn).items():
                 row[f"{name}_{k}"] = v
@@ -302,6 +312,19 @@ def main():
         print(f"{name:<12}{g('fscore@0.01')}{g('fscore@0.02')}{g('fscore@0.05')}"
               f"{g('chamfer_L1','p90')}{g('normal_consistency')}{g('iou_hacim')}")
     print("(her hucre: ortalama/p10; Chamfer'da ortalama/p90 -- dusuk iyi)")
+    print("")
+    print("TOPOLOJI (Faz C mesh cikisi icin):")
+    for name in ("ogretmen", "ogrenci"):
+        w = summary.get(f"{name}_watertight")
+        if not w:
+            continue
+        eu = summary.get(f"{name}_euler", {})
+        bl = summary.get(f"{name}_bilesen", {})
+        nan = float("nan")
+        print(f"  {name:<10} kapali %{w['ort']*100:>5.1f}"
+              f" | Euler ort {eu.get('ort', nan):>9.1f} med {eu.get('med', nan):>8.1f}"
+              f" | bilesen ort {bl.get('ort', nan):>5.1f}")
+    print("  (Euler 2 = kure gibi tek kapali yuzey; cok negatif = tunel dolu)")
     if atlanan:
         from collections import Counter
         print("\natlanma sebepleri:", dict(Counter(v.split(":")[0] for v in atlanan.values())))

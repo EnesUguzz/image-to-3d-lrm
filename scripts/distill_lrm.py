@@ -47,7 +47,7 @@ def main():
     torch.backends.cudnn.allow_tf32 = True
     torch.manual_seed(0)
 
-    tk = torch.load(a.teacher, map_location="cpu")
+    tk = torch.load(a.teacher, map_location="cpu", weights_only=False)
     target = tk["triplanes"].to(DEV)
     # OLCEK EGRISI icin bankanin ILK n_obj objesi (bench uid'leri ic ice oldugu
     # gibi burada da alt kume ust kumenin ONEKI olsun -- tek degisken: obje sayisi).
@@ -89,7 +89,7 @@ def main():
         0.5 * (1 + math.cos(math.pi * (s - a.warmup) / max(1, a.steps - a.warmup))))
     start = 0
     if a.resume and os.path.isfile(a.out):
-        ck = torch.load(a.out, map_location="cpu")
+        ck = torch.load(a.out, map_location="cpu", weights_only=False)
         model.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"])
         sched.load_state_dict(ck["sched"]); start = ck["step"]
         print(f"resume: step {start}", flush=True)

@@ -35,7 +35,7 @@ def main():
     a = ap.parse_args()
     torch.manual_seed(0); torch.backends.cuda.matmul.allow_tf32 = True
 
-    ck = torch.load(a.tp, map_location="cpu")
+    ck = torch.load(a.tp, map_location="cpu", weights_only=False)
     target = ck["triplanes"].to(DEV)          # (N,3,C,H,W)
     uids, ocfg = ck["uids"], ck["cfg"]
     nerf = (TriplaneNeRF(in_dim=3 * ocfg["tp_ch"], hidden=64) if ocfg["mlp_layers"] == 2

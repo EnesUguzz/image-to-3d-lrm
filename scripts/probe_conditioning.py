@@ -53,7 +53,7 @@ def main():
     if os.path.isfile(ckpt):
         print("\n=== EGITILMIS (last.pt step 6500) ===")
         m_tr = LRM(n_samples=48).to(device).eval()
-        m_tr.load_state_dict(torch.load(ckpt, map_location="cpu")["model"])
+        m_tr.load_state_dict(torch.load(ckpt, map_location="cpu", weights_only=False)["model"])
         probe(m_tr, itA, itB, device, "trained")
 
 

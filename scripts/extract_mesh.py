@@ -70,6 +70,77 @@ def to_mesh(dens, cols, bound, level):
     return m
 
 
+def puruzsuzlestir(mesh, iters, lamb=0.5, nu=-0.53, max_shrink=0.05):
+    """Taubin pruzsuzlestirme -- yuzeydeki "kopuk" icin (2026-08-27, olculdu).
+
+    Yogunluk alani 64^2 triplane'in bilineer interpolasyonu + nokta-bazli MLP
+    oldugu icin HUCRE ALTI yapi tasiyamaz; her hucre yumusak bir tumsege
+    donusuyor. Olculdu: gucun %95'i 3.5 hucre (~0.06 dunya birimi) USTUNDE.
+    Yani bu olcegin altinda GERCEK SINYAL YOK -- pruzsuzlestirme veri degil
+    artefakt siliyor. Triplane'i 128^2 yapmak %95 bandini sadece %6 dusurdu
+    (+%5 egitim suresi, ustelik ogretmen bankasini gecersiz kilardi), o yuzden
+    mimari degisikligi degil son-islem tercih edildi.
+
+    Taubin, Laplacian DEGIL: lamb>0 buzer, nu<0 geri sisirir => hacim korunur.
+    Olculdu: 5 it %-0.7, 15 it %-1.9, 40 it %-4.4.
+    """
+    if iters <= 0:
+        return mesh
+    import trimesh
+    # HACIM KORUMASI (test yakaladi): lamb/nu dengesi MESH YOGUNLUGUNA bagli.
+    # Olculdu, 5 iterasyon: 158k ucgenli mesh'te %-0.7, 1.3k ucgenli
+    # ikosferde %-8.4, 12 ucgenli kutuda %-99.97 (obje yok oluyor).
+    # Kaba bir mesh sessizce buzulmesin diye iterasyon geri sarilir.
+    hedef = mesh.volume if mesh.is_watertight else None
+    n = int(iters)
+    while n > 0:
+        m = mesh.copy()
+        trimesh.smoothing.filter_taubin(m, lamb=lamb, nu=nu, iterations=n)
+        m.visual = mesh.visual    # filtre kose renklerini dusurebiliyor
+        if hedef is None or not m.is_watertight:
+            return m              # hacim tanimsiz; olcemeyiz, dokunmayiz
+        if abs(m.volume / hedef - 1.0) <= max_shrink:
+            return m
+        n //= 2
+    return mesh
+
+def srgb_to_linear(c):
+    """NeRF renkleri sRGB uzayinda ogreniliyor (egitim hedefi sRGB PNG).
+
+    glTF 2.0 spec'i COLOR_0'i LINEER kabul eder ve tuketici ekrana basarken
+    sRGB'ye cevirir. Donusum yapilmadan yazilirsa renkler ikinci kez
+    aydinlatilir: olculdu, koltugun ortalama rengi 0.66 -> ekranda 0.84,
+    orta ton lila acik gri-beyaza yikandi.
+    """
+    import numpy as np
+    c = np.asarray(c, dtype=np.float64)
+    return np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
+
+def export_glb(mesh, path):
+    """glTF/GLB standardi Y-UP; bizim dunyamiz (Blender/render pipeline) Z-UP.
+
+    Donusum uygulanmadan yazilirsa standarda uyan HER tuketici (Blender import,
+    Faz C'deki three.js) objeyi yan yatirir -- olculdu: dik siringa yatay cikti,
+    bbox ise [0.158, 0.17, 0.996] ile dogru (en uzun eksen Z) oldugunu gosteriyordu.
+    Yani geometri degil SADECE dis aktarim konvansiyonu hataliydi.
+
+    Z-up -> Y-up:  (x, y, z) -> (x, z, -y)   (X ekseni etrafinda -90 derece)
+    Kopya uzerinde calisir; cagirandaki mesh dunya (Z-up) uzayinda kalir, boylece
+    silhouette_iou gibi olcumler etkilenmez.
+    """
+    import numpy as np
+    m = mesh.copy()
+    v = np.asarray(m.vertices, dtype=np.float64)
+    m.vertices = np.stack([v[:, 0], v[:, 2], -v[:, 1]], axis=-1)
+    vc = getattr(m.visual, 'vertex_colors', None)
+    if vc is not None and len(vc):
+        vc = np.asarray(vc).copy()
+        c = vc[:, :3].astype(np.float64) / 255.0
+        vc[:, :3] = np.clip(srgb_to_linear(c) * 255.0 + 0.5, 0, 255).astype(np.uint8)
+        m.visual.vertex_colors = vc
+    m.export(path)
+    return path
+
 def silhouette_iou(mesh, renders_dir, uid, view_idx, res=128, n_pts=120000):
     """Mesh silüeti GT alpha maskesine ne kadar oturuyor (0-1).
 
@@ -140,6 +211,9 @@ def main():
                     help="marching cubes esigi (0 = otomatik tarama)")
     ap.add_argument("--out", default="dataset/mesh_out")
     ap.add_argument("--tag", default="mesh")
+    ap.add_argument("--smooth", type=int, default=0,
+                    help="Taubin pruzsuzlestirme iterasyonu (yuzeydeki kopuk icin). "
+                         "5-15 onerilir, hacim kaybi %0.7-%1.9. 0 = kapali.")
     ap.add_argument("--auto_level", action="store_true",
                     help="esigi GT silüet IoU'sunu maksimize ederek sec")
     a = ap.parse_args()
@@ -219,7 +293,7 @@ def main():
             iou, lv, mesh = scored[0]
             r = report(mesh)
             path = os.path.join(a.out, f"{a.tag}_{uid[:8]}.glb")
-            mesh.export(path)
+            export_glb(puruzsuzlestir(mesh, a.smooth), path)
             with open(os.path.join(a.out, f"{a.tag}_{uid[:8]}.json"), "w",
                       encoding="utf-8") as f:
                 json.dump({"uid": uid, "level": lv, "iou": iou, "grid": a.grid,
@@ -256,7 +330,7 @@ def main():
 
     lv, mesh, r = best
     path = os.path.join(a.out, f"{a.tag}_{uid[:8]}.glb")
-    mesh.export(path)
+    export_glb(puruzsuzlestir(mesh, a.smooth), path)
     # esik dayanikliligi: hacim esikle ne kadar oynuyor
     vols = [rr["volume"] for _, rr in rows if rr and rr.get("volume")]
     stab = (max(vols) / min(vols)) if len(vols) > 1 and min(vols) > 0 else None

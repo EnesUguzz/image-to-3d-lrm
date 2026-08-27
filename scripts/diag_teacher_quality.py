@@ -14,13 +14,13 @@ from lrm.triplane import sample_triplane
 from lrm.renderer import volume_render
 
 DEV, RES = "cuda", 128
-ck = torch.load("dataset/lrm_ckpts/last.pt", map_location="cpu")
+ck = torch.load("dataset/lrm_ckpts/last.pt", map_location="cpu", weights_only=False)
 print(f"checkpoint step: {ck['step']}")
 if "teacher" in ck:
     teacher = ck["teacher"]
     print("ogretmen: checkpoint'ten")
 else:   # donuk ogretmen checkpoint'e yazilmaz; asama-1 dosyasindan oku
-    teacher = torch.load("dataset/lrm_ckpts/teacher_init.pt", map_location="cpu")["triplanes"]
+    teacher = torch.load("dataset/lrm_ckpts/teacher_init.pt", map_location="cpu", weights_only=False)["triplanes"]
     print("ogretmen: teacher_init.pt'den (donuk)")
 print(f"ogretmen: {tuple(teacher.shape)}  std={teacher.std():.4f}  |mean|={teacher.mean().abs():.4f}")
 
@@ -42,7 +42,7 @@ def render(tp, c2w, K):
 # ASIL OLCUM: ogrencinin triplane'i ogretmeninkine yaklasiyor mu?
 # Render kalitesi yaniltici olabilir (NeRF olcegi uyusmazsa bos cikar);
 # distilasyon triplane UZAYINDA calisir, o yuzden orada olcmek gerekir.
-tinit = torch.load("dataset/lrm_ckpts/teacher_init.pt", map_location="cpu")
+tinit = torch.load("dataset/lrm_ckpts/teacher_init.pt", map_location="cpu", weights_only=False)
 tp_ref = tinit["triplanes"]
 rel = []
 with torch.no_grad():
