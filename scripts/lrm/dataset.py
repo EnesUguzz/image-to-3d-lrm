@@ -25,12 +25,51 @@ def _load_rgba(path, res):
     return arr
 
 
+def _crop_input(png_path, out_res, master_res, intrinsic, pad=1.15):
+    """Girdi goruntusunu siluet bbox'ina KARE kirpar ve intrinsic'i kaydirir.
+
+    Kare kirpma sart: dikdortgen kirpip kareye resize etmek en-boy oranini
+    bozar ve kamera modelini gecersiz kilar. Kirpma penceresi bbox merkezli,
+    kenari max(bbox_w, bbox_h) * pad.
+
+    Intrinsic: once kirpma (ana nokta kaydir), sonra olcekle. Sira onemli.
+    """
+    from PIL import Image
+    im = Image.open(png_path).convert("RGBA")
+    W, H = im.size
+    a = np.asarray(im, dtype=np.float32)[..., 3] / 255.0
+    ys, xs = np.nonzero(a > 0.05)
+    if len(xs) == 0:                      # bos render: kirpma yok
+        arr = torch.from_numpy(
+            np.asarray(im.resize((out_res, out_res), Image.BILINEAR),
+                       dtype=np.float32) / 255.0).permute(2, 0, 1)
+        K = cameras.scale_intrinsics(
+            torch.tensor(intrinsic, dtype=torch.float32), master_res, out_res)
+        return arr, K
+    cx_b = 0.5 * (float(xs.min()) + float(xs.max()) + 1.0)
+    cy_b = 0.5 * (float(ys.min()) + float(ys.max()) + 1.0)
+    yan = max(float(xs.max() - xs.min() + 1), float(ys.max() - ys.min() + 1)) * pad
+    yan = float(min(yan, min(W, H)))      # goruntuden buyuk olamaz
+    x0 = float(np.clip(cx_b - yan / 2.0, 0, W - yan))
+    y0 = float(np.clip(cy_b - yan / 2.0, 0, H - yan))
+    im = im.resize((out_res, out_res), Image.BILINEAR,
+                   box=(x0, y0, x0 + yan, y0 + yan))
+    arr = torch.from_numpy(np.asarray(im, dtype=np.float32) / 255.0).permute(2, 0, 1)
+    K = torch.tensor(intrinsic, dtype=torch.float32).clone()
+    if master_res != W:                   # intrinsic master cozunurlukte saklanir
+        K = cameras.scale_intrinsics(K, master_res, W)
+    K[0, 2] -= x0                         # kirpma: ana noktayi kaydir
+    K[1, 2] -= y0
+    K = cameras.scale_intrinsics(K, yan, out_res)   # sonra olcekle
+    return arr, K
+
+
 class LRMDataset(torch.utils.data.Dataset):
     def __init__(self, train_list_path, renders_dir, split="train",
                  input_res=224, render_res=128, n_sup=4, augment=True, seed=0,
                  normalize_cams=False, deterministic=None, max_input=None,
                  force_n_input=0, region=0, render_low=64, render_high=192,
-                 fg_bias=0.75):
+                 fg_bias=0.75, input_crop=0.0):
         with open(train_list_path, encoding="utf-8") as f:
             self.uids = json.load(f)[split]
         self.renders_dir = renders_dir
@@ -39,6 +78,7 @@ class LRMDataset(torch.utils.data.Dataset):
         self.n_sup = n_sup
         self.augment = augment
         self.base_seed = seed
+        self._epoch = 0        # set_epoch() ile artirilir
         # HATA (duzeltildi): seed idx'e sabitlenince her epoch AYNI girdi gorunumu,
         # AYNI supervision gorunumleri ve AYNI augmentation cikiyordu => 16 render'in
         # 12'si hic kullanilmiyor, augmentation rastgele degil (her obje kalici olarak
@@ -64,6 +104,16 @@ class LRMDataset(torch.utils.data.Dataset):
         self.render_low = render_low
         self.render_high = render_high
         self.fg_bias = fg_bias
+        # GIRDI SIKI KIRPMA (2026-08-27 bagimsiz denetim, olculdu):
+        # `fit` normalizasyonu 16 kameradaki EN KOTU bbox kosesini cerceveye
+        # oturtuyor => fiilen kure normalizasyonuna dejenere oluyor ve obje
+        # kanonik goruumun sadece ~%9'unu kapliyor. DINOv2'nin 256 patch'inden
+        # ~19'u obje (p05: 4). Siluet bbox'ina x1.15 payla kirpinca kaplama
+        # 0.0885 -> 0.2413, patch ~19 -> ~77 (4x).
+        # Faz C ZATEN bunu yapmak zorunda (foto arka plani silinip ortalanacak),
+        # yani kapaliyken egitim ve cikarim FARKLI cercevelemede.
+        # 0.0 = kapali (eski davranis). >0 = bbox'a uygulanacak pay carpani.
+        self.input_crop = float(input_crop)
 
     def __len__(self):
         return len(self.uids)
@@ -72,11 +122,29 @@ class LRMDataset(torch.utils.data.Dataset):
         with open(os.path.join(self.renders_dir, uid, "meta.json"), encoding="utf-8") as f:
             return json.load(f)
 
+    def set_epoch(self, e):
+        """Epoch basina rastgeleligi degistirir ama TEKRAR URETILEBILIR birakir.
+
+        DataLoader worker'lari dataset'in bir KOPYASINI tasidigi icin bu,
+        epoch basi ana surecte cagrilmali; persistent_workers=True ise
+        worker kopyalari guncellenmez -> loader yeniden kurulmali ya da
+        persistent_workers kapatilmali."""
+        self._epoch = int(e)
+
     def __getitem__(self, idx):
         uid = self.uids[idx]
         meta = self._meta(uid)
-        rng = (random.Random(self.base_seed * 1_000_003 + idx)
-               if self.deterministic else random.Random())
+        if self.deterministic:
+            rng = random.Random(self.base_seed * 1_000_003 + idx)
+        else:
+            # TEKRAR URETILEBILIRLIK (2026-08-27 bagimsiz denetim):
+            # eskiden random.Random() (OS entropisi) idi. Epoch'lar arasi
+            # cesitlilik dogruydu ama KOSULAR ARASI tekrar uretilemezlik de
+            # birlikte geliyordu: ayni komutla iki kol farkli gorunum, farkli
+            # augmentation, farkli kirpma cozunurlugu goruyordu -> tek-degiskenli
+            # A/B imkansiz. Simdi cesitlilik `epoch` sayacindan geliyor.
+            rng = random.Random((self.base_seed * 1_000_003 + idx) * 1_000_003
+                                + self._epoch)
         canon = list(meta["canonical_indices"])
         views = meta["views"]
         n_views = len(views)
@@ -103,14 +171,19 @@ class LRMDataset(torch.utils.data.Dataset):
 
         input_imgs, input_c2w, input_K = [], [], []
         for i in input_idx:
-            rgba = _load_rgba(path(i), self.input_res)
+            if self.input_crop > 0:
+                rgba, Ki = _crop_input(path(i), self.input_res, master_res,
+                                       views[i]["intrinsic"], self.input_crop)
+            else:
+                rgba = _load_rgba(path(i), self.input_res)
+                Ki = K_for(i, self.input_res)
             if self.augment:
                 img = augment_input(rgba, random.Random(rng.random() * 1e9))
             else:
                 img = rgba[:3] * rgba[3:4] + (1.0 - rgba[3:4])  # temiz: BEYAZ bg
             input_imgs.append(img)
             input_c2w.append(c2w(i))
-            input_K.append(K_for(i, self.input_res))
+            input_K.append(Ki)
 
         sup_rgb, sup_premult, sup_alpha, sup_c2w, sup_K = [], [], [], [], []
         for i in sup_idx:

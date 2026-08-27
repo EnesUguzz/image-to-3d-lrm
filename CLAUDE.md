@@ -512,6 +512,57 @@ yani genelleme hakkında hiçbir şey söylemiyor.
 **Testler: 137 → 155.** Silinen yetim scriptler: `diag_attn_cond`,
 `diag_dino_color`, `diag_train_vs_val` (hepsi `eval_suite --split` ile ikame).
 
+### 2026-08-27 gecesi — bağımsız denetim + girdi kırpma A/B'si
+
+**▶ Başlatma talimatı: [`docs/TAM-EGITIM-BASLATMA.md`](docs/TAM-EGITIM-BASLATMA.md)**
+(komut, her bayrağın gerekçesi, belirsizlik bantlı nöbet tablosu, açık işler)
+
+Üç bağımsız denetçi (model/eğitim, metrikler, veri/render) projeyi eleştirdi;
+**7 kritik bulgunun 7'si de kodla doğrulandı.** Hepsi düzeltildi. Testler 137 → **164**.
+
+**⛔ `meta.json` extrinsic'leri ORTONORMAL DEĞİL** — 12/12 objede, ölçek 0,31–893.
+Ölçek eksenler arası düzgün ve ışın yönleri normalize edildiği için render'lar,
+öğretmen fitleri ve eğitim **etkilenmiyor** (bağımsız uzay-oyma doğrulaması:
+yeniden izdüşüm IoU 0,990). Ama ham matrisi okuyan yerler bozuktu.
+→ **`normalize_cams` ve cross-attention hakkındaki TÜM sonuçlar geçersiz**;
+kol D'nin çöküşü de `mask_fg_weight`'e atfedilemez. `canonicalize` düzeltildi.
+
+**⛔ "distilasyon 0,71'de takıldı" ÖLÜ SAYI** — o koşu %27'de kesilmişti.
+Gerçek plato **`val_rel = 0.3029`** (`blok2_distill.log`). Mimari taban 0,177
+(ölçüldü) ⇒ distilasyon tavanına neredeyse doymuş; kalan pay `TriplaneHead`'de.
+
+**⛔ GİRDİ KIRPMA A/B'Sİ: REDDEDİLDİ.** Sıkı kırpma conditioning sinyalini
+2,72× artırıyor (kaplama 0,092→0,250, DINOv2 patch 24→64) ama 250 obje ×
+1500 adımda held-out **top-1 %35,9 → %23,4**, IoU 0,482 → 0,447. In-sample'da
+ise DAHA İYİ (22,72 ↔ 22,48). → **Kırpma ezberi kolaylaştırıp genellemeyi bozuyor.**
+Mekanizma: tam karede objenin görüntüdeki büyüklüğü *gerçek ölçeğinin ipucu*;
+kırpma bunu yok ediyor.
+🔴 **Faz C sonucu: kullanıcı fotosu SIKI KIRPILAMAZ**, `fit` çerçeveleme
+konvansiyonu yeniden üretilmeli.
+
+**Ölçüm altyapısındaki kritik hatalar (hepsi düzeltildi):**
+- Öğretmen **öğrencinin** NeRF'iyle render ediliyordu → TAVAN çizgisi eğitim
+  boyunca kayardı (%10 kayma = 1,6 dB). `render_view(nerf=...)`.
+- **In-sample probe yoktu** → "az mı eğitildi / genellemiyor mu" ayırt edilemezdi.
+  Eklendi; val satırının altında `ACIK (in-sample − val)` basılıyor.
+- `eval_suite --split` **sessizce yok sayılıyordu** (öğretmen dosyası varsa).
+- `eval_geometry`'de **`--split` yoktu** → held-out geometri hiç ölçülemezdi.
+- F-score'un **iyi** kuyruğu **kötü** etiketiyle raporlanıyordu (p10/p90).
+- `eval_suite` **obje-başına veriyi atıyordu** → "hangi objeler çöktü" geri gelmezdi.
+- SSIM `eval_suite` ve `metrics.py`'de farklı parametrelerle (0,053 sistematik fark).
+- **Eğitim tekrar üretilemezdi** (`random.Random()`, OS entropisi) → iki A/B kolu
+  aynı komutla farklı veri görüyordu. `set_epoch` + seed.
+- Önizlemeler düz klasörde, farklı koşular birbirini eziyordu.
+
+**Yeni araç:** `scripts/kosu_raporu.py --tag X` → eğriler (PSNR+TABAN+RAKİP,
+oran, top-1, çöküş dedektörü) + önizleme zaman serisi + ön-kayıtlı kapı tablosu.
+
+**⚠️ `--lr 4e-4` tek ölçülmemiş hiperparametre** — OpenLRM'den kopyalandı ama
+onun çok-GPU global batch'i kopyalanmadı (bizimki 16). Nöbet maddesi eklendi.
+
+**Yama disiplini eklemesi:** `assert old in s` yetmiyor — **`s.count(old)`**
+kontrol et. `str.replace` iki `query` tanımını birden değiştirdi ve testler yakaladı.
+
 ## 🛠️ Çalışma Kuralları
 
 - Yaratıcı/kurulum işine başlamadan **superpowers skill'lerini** kullan

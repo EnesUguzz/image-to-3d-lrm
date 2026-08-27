@@ -73,18 +73,40 @@ def test_collate_returns_list(tmp_path):
     assert isinstance(batch, list) and len(batch) == 2
 
 
-def test_egitimde_her_epoch_farkli_gorunum_ve_augment(tmp_path):
-    """Regresyon: seed idx'e sabitlenince her epoch ayni girdi/sup gorunumu ve
-    ayni augmentation ciktisi geliyordu (16 render'in 12'si olu, augment sahte)."""
+def test_egitimde_ayni_epoch_TEKRAR_URETILEBILIR(tmp_path):
+    """DEGISTI (2026-08-27 bagimsiz denetim): eskiden egitimde random.Random()
+    (OS entropisi) kullaniliyordu. Epoch cesitliligi dogruydu ama iki A/B kolu
+    AYNI KOMUTLA bile farkli gorunum/augmentation goruyordu => tek-degiskenli
+    karsilastirma imkansizdi. Artik (seed, idx, epoch) uclusunden seed'leniyor."""
     tl, rroot = _setup(tmp_path)
-    ds = LRMDataset(tl, rroot, split="train", render_res=32, augment=True)
-    assert ds.deterministic is False
-    goruldu = {tuple(ds[0]["sup_view_idx"]) for _ in range(12)}
-    assert len(goruldu) > 1, "supervision gorunumleri epoch'lar arasi degismiyor"
-    imgs = [ds[0]["input_imgs"] for _ in range(6)]
-    assert any((imgs[0].shape != i.shape) or (imgs[0] - i).abs().mean() > 1e-6
-               for i in imgs[1:]), "augmentation rastgele degil"
+    ds = LRMDataset(tl, rroot, split="train",
+                    input_res=32, render_res=32, n_sup=2, augment=True)
+    a = ds[0]
+    b = ds[0]
+    assert a["input_view_idx"] == b["input_view_idx"], "ayni epoch ayni sonucu vermeli"
+    assert torch.allclose(a["input_imgs"], b["input_imgs"]), "augmentation da sabit olmali"
 
+
+def test_epoch_ilerleyince_gorunum_degisiyor(tmp_path):
+    """Tekrar uretilebilirlik, cesitliligi OLDURMEMELI: 16 render'in 12'si
+    kullanilmadan kalirsa duzeltilen orijinal hataya geri donmus oluruz."""
+    tl, rroot = _setup(tmp_path)
+    ds = LRMDataset(tl, rroot, split="train",
+                    input_res=32, render_res=32, n_sup=2, augment=True)
+    gorulen = set()
+    for e in range(12):
+        ds.set_epoch(e)
+        it = ds[0]
+        gorulen.add(tuple(it["input_view_idx"]) + tuple(it["sup_view_idx"]))
+    assert len(gorulen) > 1, "epoch ilerledigi halde secim sabit kaldi"
+
+
+def test_farkli_seed_farkli_secim(tmp_path):
+    tl, rroot = _setup(tmp_path)
+    kw = dict(split="train", input_res=32, render_res=32, n_sup=2, augment=True)
+    a = LRMDataset(tl, rroot, seed=0, **kw)[0]
+    b = LRMDataset(tl, rroot, seed=7, **kw)[0]
+    assert (a["input_view_idx"], a["sup_view_idx"]) !=            (b["input_view_idx"], b["sup_view_idx"])
 
 def test_val_deterministik_kalir(tmp_path):
     """Onizleme/val kararli olsun: augment kapaliyken ayni idx ayni ornegi verir."""

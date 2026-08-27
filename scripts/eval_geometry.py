@@ -151,7 +151,13 @@ def summarize(rows, keys):
         v = np.array([r[k] for r in rows if r.get(k) is not None], dtype=np.float64)
         if not len(v):
             continue
-        hi_iyi = k.startswith(("fscore", "precision", "recall", "normal", "iou", "gt_siluet"))
+        # ANAHTARLAR SISTEM ADIYLA ON EKLI: 'ogrenci_fscore@0.01'.
+        # Duz startswith("fscore") HICBIRINDE tutmuyordu => yuksek-iyi
+        # metriklerin IYI kuyrugu (p90) KOTU kuyruk (p10) etiketiyle
+        # raporlaniyordu (2026-08-27 bagimsiz denetim K4).
+        _taban = k.split("_", 1)[-1] if "_" in k else k
+        hi_iyi = _taban.startswith(("fscore", "precision", "recall", "normal",
+                                    "iou", "siluet", "volume_iou"))
         s[k] = {"ort": float(v.mean()), "med": float(np.median(v)),
                 ("p10" if hi_iyi else "p90"):
                     float(np.percentile(v, 10 if hi_iyi else 90))}
@@ -164,6 +170,13 @@ def main():
     ap.add_argument("--ckpt", default="dataset/lrm_ckpts/distilled_v2.pt")
     ap.add_argument("--teacher", default="dataset/lrm_ckpts/teacher_1024_tv.pt")
     ap.add_argument("--renders_dir", default="dataset/renders_opp_score3")
+    ap.add_argument("--train_list", default="dataset/train_list_v2.json")
+    ap.add_argument("--split", default=None,
+                    help="train/val/test. Verilirse uid'ler BURADAN gelir; "
+                         "held-out geometri olcumu ancak boyle mumkun "
+                         "(2026-08-27 denetim K3: eskiden uid'ler DAIMA ogretmen "
+                         "bankasindan geliyordu, banka da %%100 train).")
+    ap.add_argument("--uids_file", default="")
     ap.add_argument("--n_obj", type=int, default=32)
     ap.add_argument("--grid", type=int, default=128)
     ap.add_argument("--n_pts", type=int, default=10000)
@@ -184,8 +197,26 @@ def main():
     print("uid->glb haritasi yukleniyor...", flush=True)
     table = json.load(gzip.open(PATHS_GZ, "rt", encoding="utf-8"))
 
-    tk = torch.load(a.teacher, map_location="cpu", weights_only=False)
-    uids = tk["uids"][:a.n_obj]
+    tk = None if a.no_teacher else torch.load(a.teacher, map_location="cpu",
+                                              weights_only=False)
+    if a.uids_file:
+        _u = json.load(io.open(a.uids_file, encoding="utf-8"))
+        uids = (_u["uids"] if isinstance(_u, dict) else _u)[:a.n_obj]
+    elif a.split is not None:
+        uids = json.load(io.open(a.train_list, encoding="utf-8"))[a.split][:a.n_obj]
+    elif tk is not None:
+        uids = tk["uids"][:a.n_obj]
+    else:
+        uids = json.load(io.open(a.train_list, encoding="utf-8"))["train"][:a.n_obj]
+    # TAVAN yalnizca bankada BULUNAN uid'ler icin verilebilir.
+    tp_idx = None
+    if tk is not None:
+        _yer = {u: i for i, u in enumerate(tk["uids"])}
+        tp_idx = [_yer.get(u) for u in uids]
+        if any(i is None for i in tp_idx):
+            print("UYARI: uid'lerin bir kismi ogretmen bankasinda yok -> "
+                  "TAVAN satiri dusuruldu (held-out kumede beklenen).", flush=True)
+            tk, tp_idx = None, None
     model = LRM(n_samples=defaults.N_SAMPLES, bound=a.bound).to(DEV).eval()
     ck = torch.load(a.ckpt, map_location="cpu", weights_only=False)
     model.load_state_dict(ck.get("model", ck), strict=False)
@@ -252,8 +283,8 @@ def main():
         G, Gn = sample_surface(gm, a.n_pts)
 
         systems = {"ogrenci": tp_s}
-        if not a.no_teacher:
-            systems["ogretmen"] = tk["triplanes"][n].to(DEV)
+        if tk is not None:
+            systems["ogretmen"] = tk["triplanes"][tp_idx[n]].to(DEV)
         row = {"uid": uid, "gt_siluet_iou": gt_iou}
         for name, tp in systems.items():
             pm, lvl, sil = pred_mesh(tp, uid)

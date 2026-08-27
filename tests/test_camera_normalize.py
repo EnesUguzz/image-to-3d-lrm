@@ -114,3 +114,49 @@ def test_tek_kamerayla_calisir():
     out = cameras.canonicalize(cams[0], cams)
     assert out.shape == (1, 4, 4)
     assert torch.allclose(out[0, :3, :3], torch.eye(3, dtype=out.dtype), atol=1e-6)
+
+
+# --------------------------------------------------- GERCEK VERI (denetim bulgusu)
+def test_olcekli_c2w_ile_mesafe_korunur():
+    """TESTLER BUNU NEDEN KACIRDI (2026-08-27): yukaridaki _look_at() ORTONORMAL
+    matris uretiyor. Gercek meta.json ise Blender'dan gelen OBJE-BASINA UNIFORM
+    OLCEK tasiyor (olculdu: 12/12 objede, olcek 0.31-893). Sentetik test bu
+    kosulu hic gormedi; fonksiyon gercek veride kameralari orijine cekiyordu."""
+    cams = _ring(n=6)
+    for olcek in (0.0011, 0.4845, 1.0289, 34.7):
+        olcekli = cams.clone()
+        olcekli[:, :3, :3] *= olcek          # UNIFORM olcek, gercek veridekiyle ayni
+        out = cameras.canonicalize(olcekli[0], olcekli)
+        d0 = cams[:, :3, 3].norm(dim=-1)
+        d1 = out[:, :3, 3].norm(dim=-1)
+        assert torch.allclose(d0, d1, atol=1e-5),             "olcek %.4f: yaricap %.4f -> %.4f (near=0.8 icine dusuyor)" % (
+                olcek, float(d0[0]), float(d1[0]))
+
+
+def test_olcekli_c2w_ile_referans_identity():
+    cams = _ring(n=4)
+    olcekli = cams.clone()
+    olcekli[:, :3, :3] *= 0.0011
+    out = cameras.canonicalize(olcekli[0], olcekli)
+    R = out[0, :3, :3]
+    assert torch.allclose(R, torch.eye(3, dtype=R.dtype), atol=1e-6)
+    assert R.det().item() == pytest.approx(1.0, abs=1e-6)
+
+
+def test_gercek_metadan_okunan_kamera():
+    """Diskteki gercek bir meta.json ile uctan uca."""
+    import json
+    import os
+    kok = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "dataset", "renders_opp_score3")
+    if not os.path.isdir(kok):
+        pytest.skip("render dizini yok")
+    uid = sorted(os.listdir(kok))[0]
+    with open(os.path.join(kok, uid, "meta.json"), encoding="utf-8") as f:
+        meta = json.load(f)
+    c2w = torch.stack([torch.linalg.inv(torch.tensor(v["extrinsic"], dtype=torch.float64))
+                       for v in meta["views"]])
+    once = c2w[:, :3, 3].norm(dim=-1)
+    out = cameras.canonicalize(c2w[0], c2w)
+    sonra = out[:, :3, 3].norm(dim=-1)
+    assert torch.allclose(once, sonra, atol=1e-5),         "gercek veride yaricap %.4f -> %.4f degisti" % (float(once[0]), float(sonra[0]))

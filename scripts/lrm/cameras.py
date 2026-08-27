@@ -45,8 +45,20 @@ def canonicalize(ref_c2w, c2w_stack):
     AYNI donusumu tum kameralara uygular => obje her ornekte ayni yonelimden gorunur,
     optimizasyon uzayi daralir (LRM'de PSNR 15.3->19.0). Saf rotasyon oldugu icin obje
     orijinde kalir. c2w_stack: (V,4,4). Donus: (V,4,4)."""
-    R = ref_c2w[:3, :3].transpose(-1, -2)          # kanonik = identity => R = R_ref^T
+    # ORTONORMALLESTIRME SART (2026-08-27, bagimsiz denetim):
+    # meta.json'daki `extrinsic` Blender'in cam.matrix_world.inverted()'i ve
+    # sahne normalizasyonundan gelen OBJE-BASINA UNIFORM OLCEK tasiyor.
+    # Olculdu (12/12 obje): olcek 0.31 - 893 arasi, det(R_c2w) 0.0000 - 34.7.
+    # Isin yonleri normalize edildigi icin render/ogretmen ETKILENMIYOR, ama
+    # burada R^T dogrudan OTELEMEYE de uygulaniyordu => kameralar orijine dogru
+    # cekiliyor, `near` duzleminin icine giriyor, sahne bosaliyordu.
+    _R = ref_c2w[:3, :3]
+    _s = _R.norm(dim=0, keepdim=True).clamp_min(1e-12)   # uniform olcek (sutun boyu)
+    R = (_R / _s).transpose(-1, -2)                # kanonik = identity => R = R_ref^T
+    # Yigindaki rotasyonlar da ayni olcegi tasiyor; cikti ORTONORMAL olmali
+    # cunku tuketicisi (LRM.camera_feature) ham matrisi modLN kosulu yapiyor.
     rot = c2w_stack[:, :3, :3]
+    rot = rot / rot.norm(dim=1, keepdim=True).clamp_min(1e-12)
     trn = c2w_stack[:, :3, 3]
     out = c2w_stack.clone()
     out[:, :3, :3] = torch.einsum("ij,vjk->vik", R, rot)

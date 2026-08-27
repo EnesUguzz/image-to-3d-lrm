@@ -70,13 +70,25 @@ class LRM(nn.Module):
         """OpenLRM recetesi, TV 5e-4. Gercek uygulama lrm/triplane.py'de (ortak)."""
         return _tv_loss(triplane)
 
-    def render_view(self, triplane, c2w, K, H, W, bg_color=None):
+    def render_view(self, triplane, c2w, K, H, W, bg_color=None, nerf=None):
+        """nerf=None ise MODELIN kendi decoder'i kullanilir.
+
+        nerf PARAMETRESI NEDEN VAR (2026-08-27, bagimsiz denetim K5):
+        Ogretmen checkpoint'i triplane'leri ve NeRF'i BIRLIKTE optimize ediyor
+        (fit_teacher.py:68). Ogretmen triplane'ini ogrencinin NeRF'iyle render
+        etmek, TAVAN cizgisini ogrenci egitildikce KAYDIRIR. Olculdu: NeRF
+        agirliklarina %10 rastgele kayma TAVAN'i 28.94 -> 27.36 dB dusuruyor.
+        30.800 adimlik YONLU kayma bundan buyuk olur ve 'ogrenci tavani gecti'
+        gibi imkansiz bir sonuc uretebilirdi.
+        """
         o, d = cameras.rays_from_camera(c2w, K, H, W)
         o, d = o.to(triplane.device), d.to(triplane.device)
 
+        _nerf = self.nerf if nerf is None else nerf
+
         def query(pts):
             feats = sample_triplane(triplane, pts, bound=self.bound)
-            density, rgb = self.nerf(feats)
+            density, rgb = _nerf(feats)
             # sinirli obje: bound kubu disindaki noktalar tanim geregi BOS.
             # (aksi halde objeyi iskalayan arka plan isinlari triplane kenarindan
             #  density toplayip 'sisli dolgu' yapiyordu -> siluet olusmuyordu.)

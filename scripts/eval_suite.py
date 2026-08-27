@@ -159,9 +159,15 @@ class Metrics:
         if cs is not None:
             out["clip"] = cs.cpu().numpy()
         pn, gn = P.cpu().numpy(), G.cpu().numpy()
+        # PARAMETRELER lrm/metrics.py:ssim_per_object ILE AYNI OLMALI
+        # (2026-08-27 denetim K1): skimage varsayilani 7x7 DUZGUN pencere +
+        # ORNEKLEM kovaryansi; metrics.py 11x11 GAUSS + POPULASYON kovaryansi.
+        # Olculdu: ayni goruntude 0.8869 vs 0.8344 (0.053 fark, hep ayni yonde)
+        # => egitim egrisindeki SSIM ile kapi raporundaki SSIM yan yana konamazdi.
         out["ssim"] = np.array([
             ssim_fn(gn[i].transpose(1, 2, 0), pn[i].transpose(1, 2, 0),
-                    channel_axis=2, data_range=1.0) for i in range(len(pn))])
+                    channel_axis=2, data_range=1.0, gaussian_weights=True,
+                    sigma=1.5, use_sample_covariance=False) for i in range(len(pn))])
         if A_pred is not None and A_gt is not None:
             p = (A_pred > 0.5).float()
             g = (A_gt > 0.5).float()
@@ -190,12 +196,14 @@ def summarize(per_obj):
 
 # --------------------------------------------------------------------------- sistemler
 @torch.no_grad()
-def render_bank(model, triplanes, data, view, res):
-    """Verilen triplane bankasini hedef gorunumde render et."""
+def render_bank(model, triplanes, data, view, res, nerf=None):
+    """Verilen triplane bankasini hedef gorunumde render et.
+
+    nerf: TAVAN icin ogretmenin KENDI decoder'i (denetim K5). None = modelinki."""
     P, A = [], []
     for i, d in enumerate(data):
         rgb, acc = model.render_view(triplanes[i], d[f"c2w_{view}"], d[f"K_{view}"],
-                                     res, res)
+                                     res, res, nerf=nerf)
         P.append(rgb); A.append(acc)
     return torch.stack(P), torch.stack(A)
 
@@ -235,7 +243,10 @@ def main():
     ap.add_argument("--teacher", default="dataset/lrm_ckpts/teacher_1024_tv.pt")
     ap.add_argument("--train_list", default="dataset/train_list_v2.json")
     ap.add_argument("--renders_dir", default="dataset/renders_opp_score3")
-    ap.add_argument("--split", default="train")
+    ap.add_argument("--split", default=None,
+                    help="train/val/test. ACIKCA verilirse ogretmen bankasini "
+                         "EZER (denetim K2). Verilmezse: banka varsa banka, "
+                         "yoksa train.")
     ap.add_argument("--uids_file", default="")
     ap.add_argument("--n_obj", type=int, default=128)
     ap.add_argument("--res", type=int, default=128)
@@ -258,16 +269,32 @@ def main():
     tk = None
     if not a.no_teacher and os.path.isfile(a.teacher):
         tk = torch.load(a.teacher, map_location="cpu", weights_only=False)
+    # UID SECIM ONCELIGI (2026-08-27 denetim K2): eskiden ogretmen dosyasi
+    # diskte varsa --split SESSIZCE YOK SAYILIYORDU. Banka %100 train oldugu
+    # icin `--split val` train objelerini olcuyor, kunyeye ise 'val' yaziyordu.
+    # Artik ACIKCA verilen --split her zaman kazanir.
     if a.uids_file:
-        uids = json.load(io.open(a.uids_file, encoding="utf-8"))[:a.n_obj]
-        tidx = None
-    elif tk is not None:
-        uids = tk["uids"][:a.n_obj]
-        tidx = list(range(len(uids)))
-    else:
+        uids = json.load(io.open(a.uids_file, encoding="utf-8"))
+        uids = (uids["uids"] if isinstance(uids, dict) else uids)[:a.n_obj]
+    elif a.split is not None:
         tl = json.load(io.open(a.train_list, encoding="utf-8"))
         uids = tl[a.split][:a.n_obj]
-        tidx = None
+    elif tk is not None:
+        uids = tk["uids"][:a.n_obj]
+    else:
+        tl = json.load(io.open(a.train_list, encoding="utf-8"))
+        uids = tl["train"][:a.n_obj]
+    # Ogretmen (TAVAN) yalnizca bankada BULUNAN uid'ler icin verilebilir.
+    tidx = None
+    if tk is not None:
+        _yer = {u: i for i, u in enumerate(tk["uids"])}
+        tidx = [_yer.get(u) for u in uids]
+        _bulunan = sum(1 for i in tidx if i is not None)
+        if _bulunan < len(uids):
+            print("UYARI: %d/%d obje ogretmen bankasinda YOK -> TAVAN satiri "
+                  "dusuruldu (held-out kumede beklenen)." % (len(uids) - _bulunan,
+                                                             len(uids)), flush=True)
+            tk, tidx = None, None
     print(f"degerlendirme: {len(uids)} obje | res {a.res} | GIRDI GORUNUM SAYISI "
           f"{a.n_input} | yeni gorunum {NOVEL_VIEW}", flush=True)
 
@@ -288,16 +315,30 @@ def main():
     systems = {"ogrenci": tp_student}
     if tk is not None and tidx is not None:
         systems["ogretmen"] = [tk["triplanes"][i].to(DEV) for i in tidx[:len(uids)]]
+        # Ogretmenin kendi decoder'i (fit_teacher triplane + NeRF'i BIRLIKTE
+        # optimize ediyor). Yoksa TAVAN, ogrenci egitildikce kayar.
+        from lrm.nerf import TriplaneNeRF
+        _tn = TriplaneNeRF(in_dim=96, hidden=64).to(DEV).eval()
+        _tn.load_state_dict(tk["nerf"])
+        for _p in _tn.parameters():
+            _p.requires_grad_(False)
+        tk["nerf_mod"] = _tn
 
     results, previews = {}, {}
+    per_obj_kayit = {}          # denetim K8: ham diziler
     for view in ("girdi", "yeni"):
         G = torch.stack([d[f"gt_{view}"] for d in data])
         Ag = torch.stack([d[f"al_{view}"] for d in data])
         results[view] = {}
 
         for name, tps in systems.items():
-            P, A = render_bank(model, tps, data, view, a.res)
+            # TAVAN kendi decoder'iyla render edilir (denetim K5): ogretmen
+            # triplane'i + ogrencinin NeRF'i = egitildikce KAYAN bir cetvel.
+            _nerf = tk["nerf_mod"] if (name == "ogretmen" and tk) else None
+            P, A = render_bank(model, tps, data, view, a.res, nerf=_nerf)
             po = M.per_object(P, G, A, Ag)
+            per_obj_kayit.setdefault(view, {})[name] = {
+                k: np.asarray(v).tolist() for k, v in po.items()}
             g = guards.collapse_flags(preds=P, acc_mean=float(A.mean()))
             results[view][name] = {
                 **summarize(po),
@@ -311,15 +352,21 @@ def main():
         # TABAN: ortalama-obje
         Pm = G.mean(0, keepdim=True).expand_as(G).contiguous()
         Am = Ag.mean(0, keepdim=True).expand_as(Ag).contiguous()
+        _po_taban = M.per_object(Pm, G, Am, Ag)
+        per_obj_kayit.setdefault(view, {})['ortalama(TABAN)'] = {
+            k: np.asarray(v).tolist() for k, v in _po_taban.items()}
         results[view]["ortalama(TABAN)"] = {
-            **summarize(M.per_object(Pm, G, Am, Ag)),
+            **summarize(_po_taban),
             "top1": 0.0, "sans": 1.0 / len(data), "acc": float(Am.mean()),
             "obj_std": 0.0, "dejenere": True}
 
         # RAKIP: en-yakin-komsu
         Pn, An = neighbor_baseline(data, view)
+        _po_rakip = M.per_object(Pn, G, An, Ag)
+        per_obj_kayit.setdefault(view, {})['komsu(RAKIP)'] = {
+            k: np.asarray(v).tolist() for k, v in _po_rakip.items()}
         results[view]["komsu(RAKIP)"] = {
-            **summarize(M.per_object(Pn, G, An, Ag)),
+            **summarize(_po_rakip),
             "top1": top1(Pn, G), "sans": 1.0 / len(data), "acc": float(An.mean()),
             "obj_std": guards.inter_object_std(Pn), "dejenere": False}
 
@@ -327,7 +374,12 @@ def main():
     stamp = runstamp.run_stamp(vars(a))
     path = os.path.join(a.out, f"eval_{a.tag}.json")
     with io.open(path, "w", encoding="utf-8") as f:
-        json.dump({"summary": results, "uids": uids, "stamp": stamp}, f, indent=1)
+        # OBJE-BASINA DIZILER (2026-08-27 denetim K8): eskiden sadece ozet
+        # yaziliyordu. 'Hangi objeler coktu, ortak paydalari ne?' ve iki
+        # checkpoint arasinda ESLESTIRILMIS test bunlar olmadan imkansiz,
+        # ve modeli tekrar kosturmak gerekirdi (last_*.pt ezilmis olur).
+        json.dump({"summary": results, "per_object": per_obj_kayit,
+                   "uids": uids, "stamp": stamp}, f, indent=1)
 
     order = ["ogretmen", "ogrenci", "komsu(RAKIP)", "ortalama(TABAN)"]
     for view in ("girdi", "yeni"):

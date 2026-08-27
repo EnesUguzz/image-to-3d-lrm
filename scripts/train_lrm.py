@@ -18,7 +18,7 @@ from lrm import cameras
 from lrm import defaults
 from lrm import metrics as MET
 from lrm import guards, runstamp
-from lrm.dataset import LRMDataset, _load_rgba, lrm_collate
+from lrm.dataset import LRMDataset, _load_rgba, lrm_collate, _crop_input
 from lrm.model import LRM
 from lrm.losses import LRMLoss
 from lrm.triplane import sample_triplane
@@ -91,7 +91,7 @@ def load_checkpoint(path, model, opt, scheduler):
 
 
 def build_val_probe(renders_dir, uids, render_res, input_res=224, device="cuda",
-                    normalize_cams=False):
+                    normalize_cams=False, input_crop=0.0):
     """SABIT val problemi: her obje icin girdi = kanonik[0] (on, az 0 el 20),
     hedef = kanonik[1] ve [2] (yan + arka). Kanonik acilar TUM objelerde ayni
     oldugu icin metrik objeler arasi karsilastirilabilir; supervision gorunumleri
@@ -115,7 +115,15 @@ def build_val_probe(renders_dir, uids, render_res, input_res=224, device="cuda",
             return torch.linalg.inv(torch.tensor(views[i]["extrinsic"], dtype=torch.float32))
 
         i_in = canon[0]
-        rgba = _load_rgba(os.path.join(renders_dir, uid, views[i_in]["file"]), input_res)
+        # GIRDI CERCEVELEMESI EGITIMLE AYNI OLMALI. Egitim kirpilmis girdi
+        # kullanirken val tam kare kullanirsa model val'de DAGITIM DISI bir
+        # girdi gorur ve kirpma kolu haksiz yere kotu olcuulur.
+        _p = os.path.join(renders_dir, uid, views[i_in]["file"])
+        if input_crop > 0:
+            rgba, _Kin = _crop_input(_p, input_res, master,
+                                     views[i_in]["intrinsic"], input_crop)
+        else:
+            rgba, _Kin = _load_rgba(_p, input_res), K_for(i_in, input_res)
         img = rgba[:3] * rgba[3:4] + (1.0 - rgba[3:4])          # temiz beyaz bg
         tg_rgb, tg_c2w, tg_K, tg_alpha = [], [], [], []
         for i in canon[1:3]:
@@ -133,7 +141,7 @@ def build_val_probe(renders_dir, uids, render_res, input_res=224, device="cuda",
         probe.append(dict(
             uid=uid,
             ii=img[None].to(device), ic=in_c2w.to(device),
-            ik=K_for(i_in, input_res)[None].to(device),
+            ik=_Kin[None].to(device),
             tc=tgt_c2w.to(device), tk=torch.stack(tg_K).to(device),
             gt=torch.stack(tg_rgb).to(device),
             ga=torch.stack(tg_alpha).to(device)))
@@ -244,6 +252,7 @@ def train(train_list, renders_dir, steps=40000, micro_batch=2, grad_accum=4,
           collapse_after=None, region=64, render_low=64, render_high=192,
           fg_bias=0.75, workers=6, density_bias=0.0, noise_std=0.0,
           mask_fg_weight=None,
+          input_crop=0.0,
           bound=defaults.BOUND, normalize_cams=False, enc_lr_scale=0.1,
           ckpt_dir=None, uids_file="", n_obj=0, tag="", init_from="",
           force_cfg=False,
@@ -265,6 +274,7 @@ def train(train_list, renders_dir, steps=40000, micro_batch=2, grad_accum=4,
                 noise_std=noise_std, bound=bound, region=region,
                 n_sup=n_sup, render_res=render_res, amp=amp,
                 fg_bias=fg_bias, snapshot_every=snapshot_every,
+                input_crop=input_crop,
                 mask_fg_weight=('RGB ile ayni (5.0)' if mask_fg_weight is None
                                 else mask_fg_weight),
                 augment=augment, init_from=init_from or '-',
@@ -285,6 +295,7 @@ def train(train_list, renders_dir, steps=40000, micro_batch=2, grad_accum=4,
                           # coarse-to-fine faz gecisinin yerine gecer.
                           region=region, render_low=render_low,
                           render_high=render_high, fg_bias=fg_bias,
+                          input_crop=input_crop,
                           # gorunum rastgeleligi augment'ten BAGIMSIZ olmali:
                           # --no_augment ile deterministik olunca her obje hep ayni
                           # 4 supervision gorunumunu goruyordu (16 render'in 12'si olu)
@@ -351,7 +362,17 @@ def train(train_list, renders_dir, steps=40000, micro_batch=2, grad_accum=4,
     # KRITIK: model kanoniklestirilmis kameralarla egitiliyorsa val problemi de
     # ayni donusumden gecmeli; yoksa model dagitim disi kamera gomulmesi gorur.
     val_probe = build_val_probe(renders_dir, val_ds.uids[:val_n], render_res,
-                                device=device, normalize_cams=normalize_cams)
+                                device=device, normalize_cams=normalize_cams,
+                                input_crop=input_crop)
+    # IN-SAMPLE PROB (2026-08-27 bagimsiz denetim K7): egitim setinden AYNI
+    # olcekte ikinci bir prob. Olmadan, 10 saat sonra val duz kalirsa
+    # 'az egitildi' ile 'ezberledi ama genellemiyor' AYIRT EDILEMEZ -- ki bu,
+    # projenin tekrarlayan tek sorunu (32/250'de %100, 2635'te kirildi).
+    # Egitim kaybi bunun yerine gecmez: kayip 64^2 on-plana yanli YAMADA,
+    # MSE+LPIPS+mask karisimi; val ise tam 128^2 kanonik goruumde saf PSNR.
+    ins_probe = build_val_probe(renders_dir, train_ds.uids[:val_n], render_res,
+                               device=device, normalize_cams=normalize_cams,
+                                input_crop=input_crop)
     # Onizlemeler KOSU BASINA ayri klasore: duz klasorde farkli kosular
     # ayni adim numarasinda birbirini eziyordu (kanit kaybi).
     _prev_dir = os.path.join(PREVIEW_DIR, tag or "kosu")
@@ -362,15 +383,25 @@ def train(train_list, renders_dir, steps=40000, micro_batch=2, grad_accum=4,
     loader = torch.utils.data.DataLoader(
         train_ds, batch_size=micro_batch, shuffle=True, drop_last=True,
         num_workers=workers, collate_fn=lrm_collate,
-        persistent_workers=bool(workers), pin_memory=False,
+        # persistent_workers=False SART (2026-08-27 denetim): worker'lar
+        # dataset'in KOPYASINI tasir; set_epoch() ana surecte cagrilinca
+        # kalici worker'lar guncellemeyi GORMEZ ve her epoch AYNI gorunumler
+        # gelir -- duzeltilen orijinal RNG hatasinin aynisi. Worker yeniden
+        # dogusu epoch basina ~2 sn, 40 epoch'ta ~1 dk (10 saatte ihmal).
+        persistent_workers=False, pin_memory=False,
         **({"prefetch_factor": 4} if workers else {}))
+    _epoch = 0
+    train_ds.set_epoch(_epoch)
     _it = iter(loader)
 
     def next_batch():
-        nonlocal _it
+        nonlocal _it, _epoch
         try:
             return next(_it)
         except StopIteration:
+            # EPOCH SINIRI: rastgeleligi ilerlet ama TEKRAR URETILEBILIR birak.
+            _epoch += 1
+            train_ds.set_epoch(_epoch)
             _it = iter(loader)
             return next(_it)
 
@@ -644,6 +675,9 @@ def train(train_list, renders_dir, steps=40000, micro_batch=2, grad_accum=4,
                           os.path.join(_prev_dir, f"val_{step:06d}.png"), render_res)
             vm = val_metrics(model, val_probe, render_res, device,
                              psnr_history=_psnr_hist)
+            # in-sample: pahali metrikler kapali (LPIPS/SSIM), sadece acik
+            # farki gosterecek cekirdek sayilar -> ek maliyet ~%1
+            im = val_metrics(model, ins_probe, render_res, device, full=False)
             if vm:
                 _psnr_hist.append(vm["psnr"])
                 # TAVAN yok (val objelerinin ogretmeni yok) ama TABAN ve RAKIP
@@ -660,6 +694,18 @@ def train(train_list, renders_dir, steps=40000, micro_batch=2, grad_accum=4,
                         f"lpips={vm['lpips']:.3f} (p90 {vm.get('lpips_p90', float('nan')):.3f}) "
                         f"iou={vm.get('iou', float('nan')):.3f} "
                         f"(p10 {vm.get('iou_p10', float('nan')):.3f})")
+                if im:
+                    _acik = im['psnr'] - vm['psnr']
+                    logger.info(
+                        f"  IN-SAMPLE psnr={im['psnr']:.2f}dB "
+                        f"top1={im['top1']:.1%} oran={im['ratio']:.3f} "
+                        f"| ACIK (in-sample - val) = {_acik:+.2f} dB")
+                    # Teshis: acik BUYUK ise ezberliyor (veri/regularizasyon),
+                    # acik KUCUK ve ikisi de dusukse yetersiz egitim/kapasite.
+                    if _acik < 0.5 and vm['psnr'] <= vm['taban_psnr']:
+                        logger.warning(
+                            "  [TESHIS] in-sample de tabanda: bu bir GENELLEME "
+                            "sorunu DEGIL -- yetersiz egitim ya da kapasite/tarife.")
                 if vm["psnr"] <= vm["komsu_psnr"]:
                     logger.warning(
                         f"[VAL step {step}] model EN-YAKIN-KOMSU baseline'ini gecemiyor "
@@ -676,9 +722,13 @@ def train(train_list, renders_dir, steps=40000, micro_batch=2, grad_accum=4,
                     logger.info("  " + runstamp.format_delta(
                         runstamp.weight_delta(model.encoder, _enc_snap), "encoder"))
                 with open(val_jsonl, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(dict(step=step, tag=tag or "-",
-                                            stamp=_stamp["config_hash"],
-                                            **vm)) + chr(10))
+                    _kayit = dict(step=step, tag=tag or "-",
+                                  stamp=_stamp["config_hash"], **vm)
+                    if im:
+                        _kayit["insample"] = {k: im[k] for k in
+                                              ("psnr", "top1", "ratio", "acc_mean")
+                                              if k in im}
+                    f.write(json.dumps(_kayit) + chr(10))
         if step > 0 and step % ckpt_every == 0:
             if save_checkpoint(last_ckpt, model, opt, scheduler, step,
                                teacher if opt_t is not None else None, opt_t,
@@ -737,6 +787,10 @@ if __name__ == "__main__":
                     help="ornek basina render cozunurlugu alt siniri (OpenLRM 64)")
     ap.add_argument("--render_high", type=int, default=192,
                     help="ornek basina render cozunurlugu ust siniri (OpenLRM 192)")
+    ap.add_argument("--input_crop", type=float, default=0.0,
+                    help="girdi fotosunu siluet bbox'ina KARE kirp (pay carpani, "
+                         "1.15 onerilir). Olculdu: kaplama 0.092 -> 0.250 (2.7x), "
+                         "DINOv2 patch 24 -> 64. Faz C zaten bunu yapacak. 0 = kapali.")
     ap.add_argument("--mask_fg_weight", type=float, default=None,
                     help="mask kaybinda on-plan agirligi (None=RGB ile ayni, 5.0). "
                          "0.0 = tekdusze mask => arka planin BOS olmasi sinyali 3.5x "
@@ -833,6 +887,7 @@ if __name__ == "__main__":
           render_low=a.render_low, render_high=a.render_high,
           fg_bias=a.fg_bias, workers=a.workers,
           mask_fg_weight=a.mask_fg_weight,
+          input_crop=a.input_crop,
           density_bias=a.density_bias, noise_std=a.noise_std, bound=a.bound,
           normalize_cams=a.normalize_cams, enc_lr_scale=a.enc_lr_scale,
           ckpt_dir=a.ckpt_dir, uids_file=a.uids_file, n_obj=a.n_obj, tag=a.tag,
