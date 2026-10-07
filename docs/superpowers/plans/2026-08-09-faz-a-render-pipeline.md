@@ -18,8 +18,8 @@
 - Determinizm: uid→açı eşlemesi `hashlib.sha1` ile (asla built-in `hash()` — process başına tuzlanır).
 - Çıktı yolları: `dataset/renders/<uid>/{000..015}.png` + `meta.json`; `dataset/manifest.jsonl`; `dataset/subset.json`.
 - Blender exe: `C:\Program Files\Blender Foundation\Blender 4.4\blender.exe`.
-- Örnek test objesi: `C:\Users\ENES OĞUZ\.objaverse\hf-objaverse-v1\glbs\000-000\001abb1a3f4c412fbd707239acb68cd6.glb`.
-- Obje kaynak kökü: `C:\Users\ENES OĞUZ\.objaverse\hf-objaverse-v1\glbs`.
+- Örnek test objesi: `%USERPROFILE%\.objaverse\hf-objaverse-v1\glbs\000-000\001abb1a3f4c412fbd707239acb68cd6.glb`.
+- Obje kaynak kökü: `%USERPROFILE%\.objaverse\hf-objaverse-v1\glbs`.
 
 ---
 
@@ -58,7 +58,7 @@ pytest>=8.0
 
 Run (PowerShell):
 ```
-cd "C:\Users\ENES OĞUZ\Desktop\3d_object_project"
+cd <proje-koku>
 py -3.10 -m venv .venv
 .\.venv\Scripts\python -m pip install -r requirements-dev.txt
 ```
@@ -440,7 +440,7 @@ import subprocess
 import pytest
 
 BLENDER = r"C:\Program Files\Blender Foundation\Blender 4.4\blender.exe"
-GLB = r"C:\Users\ENES OĞUZ\.objaverse\hf-objaverse-v1\glbs\000-000\001abb1a3f4c412fbd707239acb68cd6.glb"
+GLB = r"%USERPROFILE%\.objaverse\hf-objaverse-v1\glbs\000-000\001abb1a3f4c412fbd707239acb68cd6.glb"
 UID = "001abb1a3f4c412fbd707239acb68cd6"
 
 
@@ -851,7 +851,7 @@ Expected: tüm birim testler passed.
 
 Run:
 ```
-.\.venv\Scripts\python scripts/build_subset.py --root "C:\Users\ENES OĞUZ\.objaverse\hf-objaverse-v1\glbs" --n 5 --out dataset/subset_smoke.json
+.\.venv\Scripts\python scripts/build_subset.py --root "%USERPROFILE%\.objaverse\hf-objaverse-v1\glbs" --n 5 --out dataset/subset_smoke.json
 ```
 Expected: `subset yazildi: 5 obje -> dataset/subset_smoke.json`.
 

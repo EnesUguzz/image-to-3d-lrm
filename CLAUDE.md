@@ -67,16 +67,16 @@ dataset/
 
 ## 📦 Veri Konumu
 
-- İnen objeler: `C:\Users\ENES OĞUZ\.objaverse\hf-objaverse-v1\glbs\`
+- İnen objeler: `%USERPROFILE%\.objaverse\hf-objaverse-v1\glbs\`
   → **51.534 adet `.glb`**, ~490 GB, `<uid>.glb` formatında 160 alt klasörde.
-- URL haritası: `C:\Users\ENES OĞUZ\.objaverse\hf-objaverse-v1\object-paths.json.gz`
-- Ayrıca: `C:\Users\ENES OĞUZ\.objaverse\smithsonian\objects\` (2392 glb, alternatif set).
+- URL haritası: `%USERPROFILE%\.objaverse\hf-objaverse-v1\object-paths.json.gz`
+- Ayrıca: `%USERPROFILE%\.objaverse\smithsonian\objects\` (2392 glb, alternatif set).
 
 ## 🔗 Referans Repolar
 
 - `allenai/objaverse-xl` — veri seti + indirme paketi.
 - `allenai/objaverse-rendering` — orijinal render scriptleri. Local kopya:
-  `C:\Users\ENES OĞUZ\objaverse-rendering\scripts\` (blender_script.py, distributed.py, ...).
+  `%USERPROFILE%\objaverse-rendering\scripts\` (blender_script.py, distributed.py, ...).
 - OpenLRM — Faz B için referans implementasyon.
 
 ## ⚠️ Bilinen Tuzaklar
@@ -112,7 +112,7 @@ dataset/
   girdide blur/crop/jpeg/bg simülasyonu (Faz B dataloader'a not).
 - **Log sistemi:** `run_batch.py` zaman damgalı log (`dataset/renders/logs/render_*.log`) +
   koşu sonu özeti (`render_summary.json`: done/failed/atlandı, toplam+ort süre, en yavaşlar, hata dökümü).
-- **Kodlama tuzağı:** proje yolu **Ğ** (`ENES OĞUZ`) içeriyor → tüm json okuma/yazmalarda
+- **Kodlama tuzağı:** proje yolu **Ğ** (kullanıcı adında) içeriyor → tüm json okuma/yazmalarda
   **`encoding="utf-8"`** şart (cp1254 varsayılanı çöker). Tüm scriptlerde uygulandı.
 
 ### Faz B — LRM eğitimi: KÖK NEDEN ÇÖZÜLDÜ (2026-08-21)

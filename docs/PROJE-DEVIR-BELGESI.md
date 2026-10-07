@@ -51,7 +51,7 @@ mesh (`.glb`) çıkarılır → web'de three.js ile gösterilir.
 ## 3. Veri
 
 ### Kaynak
-- `C:\Users\ENES OĞUZ\.objaverse\hf-objaverse-v1\glbs\` — **51.534 `.glb`**, ~490 GB
+- `%USERPROFILE%\.objaverse\hf-objaverse-v1\glbs\` — **51.534 `.glb`**, ~490 GB
 - Objaverse++ (arXiv 2504.07334) **Objaverse 1.0 uid'lerini** etiketliyor → diskteki
   glb'lerle eşleşir, yeni indirme gerekmez. Kalite skoru + ikili etiketler
   (Transparency, Scene, Single Color, Not a Single Object, Figure).
@@ -306,7 +306,7 @@ Bu projede iki kez sessizce bozuldu:
 `str(a[f]).lower() == "true"` kullan. Bu hata bir kez yapıldı, tüm filtreleme yanlış çıktı.
 
 ### 7.6. Proje yolu **Ğ** içeriyor
-`ENES OĞUZ` → tüm json okuma/yazmalarda `encoding="utf-8"` şart, cp1254 varsayılanı çöker.
+kullanıcı adındaki Türkçe karakter (Ğ) → tüm json okuma/yazmalarda `encoding="utf-8"` şart, cp1254 varsayılanı çöker.
 
 ### 7.7. Eski çıktı dosyaları klasörlerde duruyor
 `dataset/lrm_val_previews/` içinde 08-20 tarihli önizlemeler bu geceki koşununkilerle

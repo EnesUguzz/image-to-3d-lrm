@@ -4,7 +4,8 @@ import subprocess
 import pytest
 
 BLENDER = r"C:\Program Files\Blender Foundation\Blender 4.4\blender.exe"
-GLB = r"C:\Users\ENES OĞUZ\.objaverse\hf-objaverse-v1\glbs\000-000\001abb1a3f4c412fbd707239acb68cd6.glb"
+GLB = os.path.join(os.path.expanduser("~"), ".objaverse", "hf-objaverse-v1", "glbs",
+                   "000-000", "001abb1a3f4c412fbd707239acb68cd6.glb")
 UID = "001abb1a3f4c412fbd707239acb68cd6"
 
 

@@ -19,7 +19,7 @@ doğrudan yükleyip eğitebileceği tutarlı bir `dataset/` klasörü. Çıktı 
 
 ## 2. Girdi & Ortam
 
-- **Girdi objeler:** `C:\Users\ENES OĞUZ\.objaverse\hf-objaverse-v1\glbs\**\<uid>.glb`
+- **Girdi objeler:** `%USERPROFILE%\.objaverse\hf-objaverse-v1\glbs\**\<uid>.glb`
   (51.534 adet, `<uid>.glb`).
 - **Blender:** 4.4, `C:\Program Files\Blender Foundation\Blender 4.4\blender.exe`.
 - **GPU:** RTX 5080 (Blackwell), Cycles + **OPTIX**.
