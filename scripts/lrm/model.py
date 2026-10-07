@@ -12,13 +12,17 @@ from lrm.encoder import DinoEncoder
 
 
 class LRM(nn.Module):
-    INPUT_RES = 224  # encoder giris cozunurlugu (intrinsic bu olcekte gelir)
+    # encoder giris cozunurlugu (intrinsic bu olcekte gelir). TEK KAYNAK:
+    # lrm/defaults.py -- iki yerde ayri yazilirsa Plucker haritasi ile gercek
+    # girdi sessizce ayrisir.
+    INPUT_RES = defaults.INPUT_RES
 
     def __init__(self, dim=512, depth=12, heads=8, triplane_res=32,
                  triplane_ch=32, nerf_hidden=64, encoder=None,
                  bound=defaults.BOUND, near=defaults.NEAR, far=defaults.FAR,
                  n_samples=defaults.N_SAMPLES, white_bg=True,
-                 cross_attn=False, density_bias=0.0, noise_std=0.0):
+                 cross_attn=False, density_bias=0.0, noise_std=0.0,
+                 head_tip="k2s2"):
         super().__init__()
         self.encoder = encoder if encoder is not None else DinoEncoder()
         self.cross_attn = cross_attn
@@ -26,7 +30,8 @@ class LRM(nn.Module):
                                           triplane_res=triplane_res,
                                           img_dim=self.encoder.embed_dim,
                                           cross_attn=cross_attn)
-        self.triplane_head = TriplaneHead(dim=dim, out_channels=triplane_ch)
+        self.triplane_head = TriplaneHead(dim=dim, out_channels=triplane_ch,
+                                          tip=head_tip)
         # ANTI-COKUS: yogunluk sifira oturunca softplus gradyani olur ve model
         # 'bos sahne' sogurucu durumundan bir daha cikamaz -- M_base, M_enc4 ve
         # K2_bf16 tam olarak boyle coktu (acc=0.0000). density_bias sisli bir
@@ -38,13 +43,22 @@ class LRM(nn.Module):
         self.white_bg = white_bg  # beyaz arka plan: rgb'nin siyaha cokme tuzagini onler
         self.patch = self.encoder.patch
 
-    def make_triplane(self, input_imgs, input_c2w, input_K):
-        tok = self.encoder(input_imgs)            # (Vi, P, 384)
+    def make_triplane(self, input_imgs, input_c2w, input_K, tok=None):
+        """tok: encoder ciktisini DISARIDAN ver (Vi,P,img_dim). None = normal.
+
+        ORACLE KOSULLANDIRMA icin (2026-09-02): encoder yerine obje basina
+        SERBEST ogrenilebilir token'lar konarak "bu token butcesindeki HERHANGI
+        bir encoder'in verebilecegi en iyi sinyal" olculur. Boylece
+        "koşullandırma mi yetersiz, transformer+head mi" ayrimi yapilabilir --
+        bugun bu ayrimi yapan hicbir olcum yok ve planin yarisi birine,
+        yarisi digerine yatirim yapiyor.
+        """
+        tok = self.encoder(input_imgs) if tok is None else tok
         Vi, P, _ = tok.shape
         side = int(P ** 0.5)                       # 16 (224/14)
         pl_list = []
         for i in range(Vi):
-            Kp = cameras.scale_intrinsics(input_K[i], 224, side)
+            Kp = cameras.scale_intrinsics(input_K[i], self.INPUT_RES, side)
             pl = cameras.plucker_map(input_c2w[i], Kp, side, side)  # (side,side,6)
             pl_list.append(pl.reshape(-1, 6))
         plucker = torch.stack(pl_list).reshape(Vi * P, 6).to(tok.device)

@@ -6,6 +6,7 @@ import os
 
 import numpy as np
 import torch
+from lrm import defaults
 from PIL import Image
 
 from lrm.dataset import LRMDataset
@@ -37,7 +38,7 @@ def overfit(train_list, renders_dir, n_obj=4, steps=2500, render_res=64,
                     render_res=render_res, n_sup=4, augment=False)
     ds.uids = _pick_high_coverage(train_list, renders_dir, n_obj)
     model = LRM(dim=dim, triplane_res=triplane_res, triplane_ch=triplane_ch,
-                n_samples=48).to(device)
+                n_samples=defaults.N_SAMPLES).to(device)
     print(f"model: dim={dim} triplane_res={triplane_res} triplane_ch={triplane_ch} "
           f"| params={sum(p.numel() for p in model.parameters() if p.requires_grad)/1e6:.1f}M",
           flush=True)
@@ -82,8 +83,8 @@ def overfit(train_list, renders_dir, n_obj=4, steps=2500, render_res=64,
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--train_list", default="dataset/train_list.json")
-    ap.add_argument("--renders_dir", default="dataset/renders")
+    ap.add_argument("--train_list", default="dataset/train_list_v2.json")
+    ap.add_argument("--renders_dir", default="dataset/renders_opp_score3")
     ap.add_argument("--n_obj", type=int, default=4)
     ap.add_argument("--steps", type=int, default=2500)
     ap.add_argument("--render_res", type=int, default=64)

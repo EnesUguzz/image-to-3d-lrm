@@ -10,6 +10,7 @@ import numpy as np, torch, torch.nn as nn
 from PIL import Image
 sys.path.insert(0, os.path.dirname(__file__))
 from lrm import cameras
+from lrm import defaults
 from lrm.model import LRM
 from lrm.nerf import TriplaneNeRF
 from lrm.triplane import sample_triplane
@@ -59,7 +60,7 @@ def main():
                          alpha=torch.stack(alpha).to(DEV), sc=torch.stack(sc).to(DEV),
                          sk=torch.stack(sk).to(DEV)))
 
-    model = LRM(n_samples=48, cross_attn=(a.arch == "cross")).to(DEV)
+    model = LRM(n_samples=defaults.N_SAMPLES, cross_attn=(a.arch == "cross")).to(DEV)
     if a.unfreeze_last > 0:
         for blk in model.encoder.model.blocks[-a.unfreeze_last:]:
             for p in blk.parameters():
@@ -86,7 +87,8 @@ def main():
                 den, rgb = nerf(sample_triplane(tp, pts, bound=ocfg["bound"]))
                 ins = (pts.abs().amax(-1, keepdim=True) <= ocfg["bound"]).to(den.dtype)
                 return den * ins, rgb
-            rgb, acc = volume_render(o.to(DEV), dd.to(DEV), 0.8, 2.2, 48, q)
+            rgb, acc = volume_render(o.to(DEV), dd.to(DEV), defaults.NEAR, defaults.FAR,
+                                     defaults.N_SAMPLES, q)
             pred = (rgb + (1 - acc)).reshape(a.res, a.res, 3).permute(2, 0, 1)
             gt = d["prem"][0] + (1 - d["alpha"][0])
             ps.append((pred - gt).pow(2).mean().item())

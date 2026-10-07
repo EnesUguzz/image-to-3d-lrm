@@ -6,6 +6,7 @@ import os
 import sys
 
 import torch
+from lrm import defaults
 
 sys.path.insert(0, os.path.dirname(__file__))
 from lrm.dataset import LRMDataset
@@ -46,13 +47,13 @@ def main():
 
     print("\n=== EGITIMSIZ (taze init) ===")
     torch.manual_seed(0)
-    m_fresh = LRM(n_samples=48).to(device).eval()
+    m_fresh = LRM(n_samples=defaults.N_SAMPLES).to(device).eval()
     probe(m_fresh, itA, itB, device, "fresh")
 
     ckpt = "dataset/lrm_ckpts/last.pt"
     if os.path.isfile(ckpt):
         print("\n=== EGITILMIS (last.pt step 6500) ===")
-        m_tr = LRM(n_samples=48).to(device).eval()
+        m_tr = LRM(n_samples=defaults.N_SAMPLES).to(device).eval()
         m_tr.load_state_dict(torch.load(ckpt, map_location="cpu", weights_only=False)["model"])
         probe(m_tr, itA, itB, device, "trained")
 

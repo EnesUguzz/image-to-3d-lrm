@@ -6,7 +6,8 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(__file__))
 from lrm.dataset import LRMDataset
 from lrm.model import LRM
-from lrm import cameras
+from lrm import cameras, imutil
+from lrm import defaults
 from PIL import Image
 
 CKPT = "dataset/lrm_ckpts/last.pt"; DEV = "cuda"; RES = 64
@@ -16,9 +17,7 @@ IN_VIEW = 0    # tek girdi: kanonik on
 
 def load(uid, ds, view, res):
     meta = ds._meta(uid); v = meta["views"][view]
-    im = Image.open(os.path.join(ds.renders_dir, uid, v["file"])).convert("RGBA")
-    a = torch.from_numpy(np.array(im)).float().permute(2, 0, 1) / 255.
-    a = F.interpolate(a[None], size=(res, res), mode="bilinear", align_corners=False)[0]
+    a = imutil.yukle_rgba(os.path.join(ds.renders_dir, uid, v["file"]), res)
     rgb = a[:3] * a[3:4] + (1 - a[3:4])
     K = cameras.scale_intrinsics(torch.tensor(v["intrinsic"], dtype=torch.float32),
                                  meta.get("resolution", 512), res)
@@ -31,7 +30,7 @@ def main():
     ds = LRMDataset("dataset/train_list.json", "dataset/renders", split="train",
                     render_res=RES, n_sup=4, augment=False)
     uids = ds.uids[:12]
-    m = LRM(n_samples=48).to(DEV).eval()
+    m = LRM(n_samples=defaults.N_SAMPLES).to(DEV).eval()
     st = torch.load(CKPT, map_location="cpu", weights_only=False); m.load_state_dict(st["model"])
     print(f"ckpt step {st['step']} | {len(uids)} train objesi | girdi view {IN_VIEW}, hedef view {SUP_VIEW}")
 

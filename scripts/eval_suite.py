@@ -47,7 +47,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from lrm import cameras, defaults, guards, runstamp
+from lrm import cameras, defaults, guards, runstamp, imutil
 from lrm.model import LRM
 
 DEV = "cuda"
@@ -63,9 +63,10 @@ def load_view(render_dir, uid, view, res):
     with io.open(f"{render_dir}/{uid}/meta.json", encoding="utf-8") as f:
         meta = json.load(f)
     v = meta["views"][view]
-    im = Image.open(f"{render_dir}/{uid}/{v['file']}").convert("RGBA")
-    a = torch.from_numpy(np.array(im)).float().permute(2, 0, 1) / 255.
-    a = F.interpolate(a[None], size=(res, res), mode="bilinear", align_corners=False)[0]
+    # 2026-09-02: burada takma-adli + premultiply-sirasi-ters kucultme vardi.
+    # BIRINCIL kapi olcum araci oldugu icin V3 tablosundaki her PSNR/SSIM/LPIPS
+    # sayisi bozuk bir GT'ye karsi olculmustu. Bkz. lrm/imutil.py.
+    a = imutil.yukle_rgba(f"{render_dir}/{uid}/{v['file']}", res)
     rgb = a[:3] * a[3:4] + (1 - a[3:4])          # beyaz zemine kompozit
     K = cameras.scale_intrinsics(torch.tensor(v["intrinsic"], dtype=torch.float32),
                                  meta.get("resolution", 512), res)
@@ -141,6 +142,7 @@ class Metrics:
         if self.clip is None:
             return None
         def emb(x):
+            # OLCEK-DENETIMI: buyutme (deger cozunurlugu <= 224; CLIP girisi 224)
             x = F.interpolate(x, size=(224, 224), mode="bicubic", align_corners=False)
             f = self.clip.encode_image((x.clamp(0, 1) - self.cm) / self.cs)
             return F.normalize(f.float(), dim=-1)
@@ -226,8 +228,9 @@ def neighbor_baseline(data, view):
     hedef-gorunum GT'si. 'Tani ve getir' stratejisinin ta kendisi."""
     # RAKIP baseline'i DAIMA ilk (kanonik on) gorunumden hesaplanir ki
     # n_input degisince baseline degismesin -- kollar karsilastirilabilir kalsin.
-    X = torch.stack([F.interpolate(d["in_img"][:1], size=(32, 32), mode="bilinear",
-                                   align_corners=False)[0] for d in data])
+    # 224 -> 32 = 7x kucultme; takma adli bilinear burada RAKIP eslesmesini
+    # kaydiriyordu (lrm/imutil.py).
+    X = torch.stack([imutil.kucult(d["in_img"][:1], 32)[0] for d in data])
     D = ((X[:, None] - X[None]) ** 2).mean((2, 3, 4))
     D.fill_diagonal_(float("inf"))
     j = D.argmin(1)

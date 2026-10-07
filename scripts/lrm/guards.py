@@ -24,9 +24,20 @@ Kullanim:
 EMPTY_COLLAPSE = "EMPTY_COLLAPSE"    # acc ~ 0: model bos sahne uretiyor
 MEAN_COLLAPSE = "MEAN_COLLAPSE"      # tum objeler icin ayni cikti (girdi kullanilmiyor)
 FROZEN_OUTPUT = "FROZEN_OUTPUT"      # ardisik degerlendirmelerde PSNR kipirdamiyor
+FULL_CUBE = "FULL_CUBE"              # acc >> GT alfa: model bound kupunu dolduruyor
 
 # Varsayilan esikler. Degistirmeden once yukaridaki kalibrasyona bak.
 ACC_MIN = 0.01          # saglikli kosuda acc.mean() ~ 0.09-0.15 (kaplama ~ %9)
+
+# 2026-09-02: ACC_MIN vardi ama UST SINIR YOKTU, ve `acc` hicbir yerde
+# GT alfa ortalamasiyla kiyaslanmiyordu. Sonuc: kol A'nin acc=0.50'si
+# (GT'nin 5.7 KATI = dolu kup cokusu) her degerlendirmede "saglikli"
+# basti, ve WM_0p0'in 2.4 kati da oyle. Olculdu (64 val objesi x
+# kanonik[1..2] = 128 goruntu): GT alfa ortalamasi = 0.0876.
+GT_ALPHA = 0.0876       # val prob hedeflerinin olculmus alfa ortalamasi
+ACC_ORAN_MAX = 3.0      # acc/GT_ALPHA bunun ustundeyse dolu-kup cokusu
+                        # (kol A 5.7x cokmustu; WM_0p0 2.4x sinirda;
+                        #  WM_0p25 1.14x = kalibre)
 INTER_STD_MIN = 0.010   # olculen bosluk: 0.0001 (cokmus) <-> 0.0382 (saglam)
 FROZEN_TOL = 0.01       # dB
 FROZEN_N = 3            # bu kadar ardisik degerlendirme ayni kalirsa donmus say
@@ -68,7 +79,8 @@ def _frozen(psnr_history, tol=FROZEN_TOL, n=FROZEN_N):
 
 def collapse_flags(preds=None, acc_mean=None, psnr_history=None,
                    acc_min=ACC_MIN, inter_std_min=INTER_STD_MIN,
-                   frozen_tol=FROZEN_TOL, frozen_n=FROZEN_N):
+                   frozen_tol=FROZEN_TOL, frozen_n=FROZEN_N,
+                   gt_alpha=GT_ALPHA, acc_oran_max=ACC_ORAN_MAX):
     """Cokme raporu dondurur.
 
     preds        : (N, ...) obje basina tahmin (opsiyonel)
@@ -86,14 +98,17 @@ def collapse_flags(preds=None, acc_mean=None, psnr_history=None,
 
     if acc is not None and acc < acc_min:
         flags.append(EMPTY_COLLAPSE)
+    acc_oran = None if (acc is None or not gt_alpha) else acc / gt_alpha
+    if acc_oran is not None and acc_oran > acc_oran_max:
+        flags.append(FULL_CUBE)
     if is_degenerate_std(istd, inter_std_min):
         flags.append(MEAN_COLLAPSE)
     if _frozen(psnr_history, frozen_tol, frozen_n):
         flags.append(FROZEN_OUTPUT)
 
-    degenerate = bool({EMPTY_COLLAPSE, MEAN_COLLAPSE} & set(flags))
+    degenerate = bool({EMPTY_COLLAPSE, MEAN_COLLAPSE, FULL_CUBE} & set(flags))
     return {"flags": flags, "degenerate": degenerate,
-            "inter_std": istd, "acc_mean": acc}
+            "inter_std": istd, "acc_mean": acc, "acc_oran": acc_oran}
 
 
 def format_flags(report):
@@ -101,6 +116,9 @@ def format_flags(report):
     parts = []
     if report.get("acc_mean") is not None:
         parts.append(f"acc={report['acc_mean']:.4f}")
+    if report.get("acc_oran") is not None:
+        # acc'yi TEK BASINA okumak yaniltiyordu; GT'ye orani okunabilir sayi.
+        parts.append(f"acc/GT={report['acc_oran']:.2f}x")
     if report.get("inter_std") is not None:
         parts.append(f"obj_std={report['inter_std']:.4f}")
     if report.get("flags"):

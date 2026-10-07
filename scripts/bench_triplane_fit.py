@@ -10,6 +10,7 @@ import numpy as np, torch, torch.nn as nn
 from PIL import Image
 sys.path.insert(0, os.path.dirname(__file__))
 from lrm import cameras
+from lrm import defaults
 from lrm.nerf import TriplaneNeRF
 from lrm.triplane import sample_triplane
 from lrm.renderer import volume_render
@@ -43,8 +44,13 @@ def main():
     ap.add_argument("--tp_res", type=int, default=64)
     ap.add_argument("--tp_ch", type=int, default=32)
     ap.add_argument("--mlp_layers", type=int, default=2)
-    ap.add_argument("--n_samples", type=int, default=48)
-    ap.add_argument("--w_lpips", type=float, default=2.0)
+    ap.add_argument("--n_samples", type=int, default=defaults.N_SAMPLES)
+    # 2026-09-02 kod incelemesi B3: varsayilan 2.0 idi. CLAUDE.md'de
+    # OLCULEREK terk edilmis deger: LPIPS baskin olunca model "ortalama
+    # obje" havzasinda kaliyor (32 obje: top-1 %25 -> %62, 0.25'te).
+    # train_lrm ve fit_teacher 0.25 kullaniyor; KAPI ARACI egitimden
+    # farkli bir tarifeyi olcuyordu. tests/test_kunye_uyumu.py hizayi tutar.
+    ap.add_argument("--w_lpips", type=float, default=0.25)
     ap.add_argument("--lr", type=float, default=1e-2)
     ap.add_argument("--bound", type=float, default=0.6)
     ap.add_argument("--tag", default="oracle")
@@ -88,7 +94,7 @@ def main():
             den, rgb = nerf(sample_triplane(tp, pts, bound=a.bound))
             ins = (pts.abs().amax(-1, keepdim=True) <= a.bound).to(den.dtype)
             return den * ins, rgb
-        rgb, acc = volume_render(o, d, 0.8, 2.2, a.n_samples, q, bg_color=bg)
+        rgb, acc = volume_render(o, d, defaults.NEAR, defaults.FAR, a.n_samples, q, bg_color=bg)
         V = c2w.shape[0]
         return (rgb.reshape(V, res, res, 3).permute(0, 3, 1, 2),
                 acc.reshape(V, res, res, 1).permute(0, 3, 1, 2))

@@ -8,6 +8,7 @@ import numpy as np, torch
 from PIL import Image
 sys.path.insert(0, os.path.dirname(__file__))
 from lrm import cameras
+from lrm import defaults
 from lrm.dataset import LRMDataset
 from lrm.model import LRM
 from lrm.triplane import sample_triplane
@@ -24,7 +25,7 @@ else:   # donuk ogretmen checkpoint'e yazilmaz; asama-1 dosyasindan oku
     print("ogretmen: teacher_init.pt'den (donuk)")
 print(f"ogretmen: {tuple(teacher.shape)}  std={teacher.std():.4f}  |mean|={teacher.mean().abs():.4f}")
 
-model = LRM(n_samples=64).to(DEV)
+model = LRM(n_samples=defaults.N_SAMPLES).to(DEV)
 model.load_state_dict(ck["model"]); model.eval()
 ds = LRMDataset("dataset/train_list.json", "dataset/renders", split="train",
                 render_res=RES, n_sup=4, augment=False)

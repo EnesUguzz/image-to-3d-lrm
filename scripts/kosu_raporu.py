@@ -153,18 +153,70 @@ def ozet(kayitlar, tag, path):
         L.append("- TABAN (ortalama goruntu): **%.2f dB**" % son["taban_psnr"])
     if "komsu_psnr" in son:
         L.append("- RAKIP (en yakin komsu): **%.2f dB**" % son["komsu_psnr"])
-    L += ["", "## On-kayitli kapilar", ""]
+    # ------------------------------------------------------------------
+    # KAPILAR IKI KATMAN (2026-08-29, bagimsiz denetim sonrasi yeniden yazildi)
+    #
+    # Eski tablonun DORDU DE cokus kapisiydi: siluet + obje-basina ortalama renk
+    # basan dejenere bir cozum dordunu de geciyordu. "4/4 GECTI" bu yuzden
+    # "basarili" degil "cokmedi" demekti. Kalite ekseni (bulaniklik, detay,
+    # kuyruk) hic olculmuyordu -- tam da modelin basarisiz oldugu eksen.
+    #
+    # KATMAN 1 (cokus): kosunun saglikli olup olmadigi. Gecmek ZORUNLU ama YETMEZ.
+    # KATMAN 2 (kalite): gercekten iyilesme var mi. Karar bunlara bakilarak verilir.
+    #   - lpips  : PSNR bulaniklasmaya KOR, LPIPS degil
+    #   - iou    : siluet/geometri
+    #   - taban_alti : ortalamanin sakladigi kuyruk -- kac obje ortalama-baseline'dan
+    #                  kotu (olculdu: %28, ortalama PSNR bunu hic gostermiyordu)
+    #   - psnr_p10   : en kotu dilim
+    # ------------------------------------------------------------------
     n = son.get("n", 64)
-    kapilar = [("oran <= 0.75", son.get("ratio", 9) <= 0.75, "%.3f" % son.get("ratio", float("nan"))),
-               ("top-1 >= 8x sans", son.get("top1", 0) >= 8.0 / n,
-                "%.1f%% (sans %.1f%%)" % (100 * son.get("top1", 0), 100.0 / n)),
-               ("TABAN'i gecti", son.get("psnr", 0) > son.get("taban_psnr", 99),
-                "%.2f vs %.2f dB" % (son.get("psnr", 0), son.get("taban_psnr", float("nan")))),
-               ("RAKIP'i gecti", son.get("psnr", 0) > son.get("komsu_psnr", 99),
-                "%.2f vs %.2f dB" % (son.get("psnr", 0), son.get("komsu_psnr", float("nan"))))]
+    cokus = [("oran <= 0.75", son.get("ratio", 9) <= 0.75, "%.3f" % son.get("ratio", float("nan"))),
+             ("top-1 >= 8x sans", son.get("top1", 0) >= 8.0 / n,
+              "%.1f%% (sans %.1f%%)" % (100 * son.get("top1", 0), 100.0 / n)),
+             ("TABAN'i gecti", son.get("psnr", 0) > son.get("taban_psnr", 99),
+              "%.2f vs %.2f dB" % (son.get("psnr", 0), son.get("taban_psnr", float("nan")))),
+             ("RAKIP'i gecti", son.get("psnr", 0) > son.get("komsu_psnr", 99),
+              "%.2f vs %.2f dB" % (son.get("psnr", 0), son.get("komsu_psnr", float("nan"))))]
+    L += ["", "## Kapi 1 -- COKUS (gecmesi zorunlu, YETMEZ)", ""]
     L += ["| kapi | durum | deger |", "|---|---|---|"]
-    for ad, gecti, deger in kapilar:
+    for ad, gecti, deger in cokus:
         L.append("| %s | %s | %s |" % (ad, "✅ GECTI" if gecti else "❌ KALDI", deger))
+
+    # KALITE esikleri: TAM_asama3 taban cizgisine gore ON-KAYITLI
+    #   lpips 0.167 -> 0.145 | iou 0.662 -> 0.70 | taban_alti 0.28 -> 0.20
+    ta = son.get("taban_alti")
+    # OLCULMEMIS metrik "basarisiz" gibi gosterilmemeli: `val_metrics(full=False)`
+    # lpips hic uretmiyor ve sentinel 9 "9.0000" diye basiliyordu -- olculmemis
+    # bir seyi sert bir basarisizlik gibi okutan rapor, bu projenin tam da
+    # kacinmaya calistigi yanilticiliktir.
+    def _kapi(ad, deger, iyi_mi, ref, bicim="%.4f"):
+        if deger is None:
+            return (ad, None, "OLCULMEDI", ref)
+        return (ad, iyi_mi(deger), bicim % deger, ref)
+
+    kalite = [_kapi("lpips <= 0.145", son.get("lpips"),
+                    lambda v: v <= 0.145, "TAM_asama3: 0.167"),
+              _kapi("iou >= 0.70", son.get("iou"),
+                    lambda v: v >= 0.70, "TAM_asama3: 0.662"),
+              ("taban-alti obje <= %20",
+               None if ta is None else (ta <= 0.20),
+               ("%.1f%%" % (100 * ta)) if ta is not None else "OLCULMEDI",
+               "TAM_asama3: ~%28"),
+              _kapi("psnr_p10 >= 17.5 dB", son.get("psnr_p10"),
+                    lambda v: v >= 17.5, "en kotu %10 dilim", "%.2f dB")]
+    L += ["", "## Kapi 2 -- KALITE (karar bunlara bakilir)", ""]
+    L += ["| kapi | durum | deger | referans |", "|---|---|---|---|"]
+    for ad, gecti, deger, ref in kalite:
+        # gecti is None => metrik HIC OLCULMEDI. "KALDI" yazmak, olculmemis bir
+        # seyi basarisizlik gibi okutur (fiilen oluyordu: lpips sentinel 9).
+        durum = "— OLCULMEDI" if gecti is None else ("✅ GECTI" if gecti else "❌ KALDI")
+        L.append("| %s | %s | %s | %s |" % (ad, durum, deger, ref))
+    olculen = [g for _, g, _, _ in kalite if g is not None]
+    gecen = sum(1 for g in olculen if g)
+    if olculen and gecen == len(olculen) and len(olculen) == len(kalite):
+        L += ["", "> ⚠️ KALITE kapilarinin HEPSI gecti. Bu ya gercek bir sicrama,"
+              " ya da esikler hala gevsek. Ikincisini eleyin: onizlemelere ve"
+              " geometri (F@0.01) sayilarina bakin."]
 
     bayrakli = [d for d in kayitlar if d.get("flags")]
     L += ["", "## Uyarilar", ""]

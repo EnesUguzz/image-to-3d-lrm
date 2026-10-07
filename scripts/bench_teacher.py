@@ -16,6 +16,7 @@ import numpy as np, torch, torch.nn as nn
 from PIL import Image
 sys.path.insert(0, os.path.dirname(__file__))
 from lrm import cameras
+from lrm import defaults
 from lrm.model import LRM
 from lrm.triplane import sample_triplane
 from lrm.renderer import volume_render
@@ -40,7 +41,7 @@ def main():
                          "yuzunden kismi kapsama kullanacagiz; bu bayrak onu test eder.")
     ap.add_argument("--teacher_off", type=float, default=0.75,
                     help="egitimin bu oranindan sonra ogretmen/distilasyon kapanir")
-    ap.add_argument("--n_samples", type=int, default=48)
+    ap.add_argument("--n_samples", type=int, default=defaults.N_SAMPLES)
     ap.add_argument("--fg_crop", type=int, default=0,
                     help="TripoSR tarzi on-plana yanli rastgele kirpma: hedefleri bu "
                          "cozunurlukte sakla (ör. 256) ve her adim rastgele kirp. "

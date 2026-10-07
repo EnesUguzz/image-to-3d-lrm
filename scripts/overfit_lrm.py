@@ -5,6 +5,7 @@ import os
 
 import numpy as np
 import torch
+from lrm import defaults
 from PIL import Image
 
 from lrm.dataset import LRMDataset
@@ -57,7 +58,7 @@ def overfit(train_list, renders_dir, n_obj=2, steps=500, render_res=64,
     ds = LRMDataset(train_list, renders_dir, split="train", input_res=224,
                     render_res=render_res, n_sup=4, augment=False)
     ds.uids = _pick_high_coverage(train_list, renders_dir, n_obj)
-    model = LRM(n_samples=48).to(device)
+    model = LRM(n_samples=defaults.N_SAMPLES).to(device)
     model.transformer.enable_checkpointing()
     loss_fn = LRMLoss(use_lpips=use_lpips).to(device)
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=lr)
@@ -88,8 +89,8 @@ def overfit(train_list, renders_dir, n_obj=2, steps=500, render_res=64,
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--train_list", default="dataset/train_list.json")
-    ap.add_argument("--renders_dir", default="dataset/renders")
+    ap.add_argument("--train_list", default="dataset/train_list_v2.json")
+    ap.add_argument("--renders_dir", default="dataset/renders_opp_score3")
     ap.add_argument("--n_obj", type=int, default=2)
     ap.add_argument("--steps", type=int, default=500)
     ap.add_argument("--render_res", type=int, default=64)

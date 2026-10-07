@@ -14,7 +14,7 @@ from PIL import Image
 
 import torch.nn as nn
 
-from lrm import cameras
+from lrm import cameras, imutil
 from lrm import defaults
 from lrm import metrics as MET
 from lrm import guards, runstamp
@@ -90,13 +90,14 @@ def load_checkpoint(path, model, opt, scheduler):
     return ck["step"], ck.get("teacher"), ck.get("opt_t")
 
 
-def build_val_probe(renders_dir, uids, render_res, input_res=224, device="cuda",
+def build_val_probe(renders_dir, uids, render_res, input_res=None, device="cuda",
                     normalize_cams=False, input_crop=0.0):
     """SABIT val problemi: her obje icin girdi = kanonik[0] (on, az 0 el 20),
     hedef = kanonik[1] ve [2] (yan + arka). Kanonik acilar TUM objelerde ayni
     oldugu icin metrik objeler arasi karsilastirilabilir; supervision gorunumleri
     uid-seed'li rastgele oldugu icin onlarla ayni sey yapilamazdi.
     Bu objeler egitimde HIC gorulmez (val split)."""
+    input_res = defaults.INPUT_RES if input_res is None else input_res
     probe = []
     for uid in uids:
         with open(os.path.join(renders_dir, uid, "meta.json"), encoding="utf-8") as f:
@@ -198,7 +199,11 @@ def val_metrics(model, probe, render_res, device="cuda", psnr_history=None,
 
     # --- KATMAN 4: TABAN ve RAKIP (metrik kalibre olsun diye her raporda)
     Pm = G.mean(0, keepdim=True).expand_as(G)
-    taban_psnr = float(MET.psnr_per_object(Pm, G)[0].mean())
+    taban_psnr_i = MET.psnr_per_object(Pm, G)[0]
+    taban_psnr = float(taban_psnr_i.mean())
+    # KUYRUK: kac obje kendi hedefi icin ortalama-baseline'dan DAHA KOTU?
+    # Ortalama PSNR bunu tamamen sakliyor (2026-08-29 bagimsiz denetim: %28).
+    taban_alti = float((psnr_i < taban_psnr_i).float().mean())
     inputs = torch.cat([d["ii"] for d in probe])
     j = MET.neighbor_indices(inputs)
     Pn = G[j]
@@ -214,7 +219,8 @@ def val_metrics(model, probe, render_res, device="cuda", psnr_history=None,
                ratio=ratio, n=len(probe), acc_mean=acc_mean,
                inter_std=rep["inter_std"], flags=rep["flags"],
                degenerate=rep["degenerate"],
-               taban_psnr=taban_psnr, komsu_psnr=komsu_psnr, komsu_top1=komsu_top1)
+               taban_psnr=taban_psnr, taban_alti=taban_alti,
+               komsu_psnr=komsu_psnr, komsu_top1=komsu_top1)
     for k in ("ssim", "lpips", "iou"):
         if k in summ:
             out[k] = summ[k]["ort"]
@@ -249,16 +255,25 @@ def train(train_list, renders_dir, steps=40000, micro_batch=2, grad_accum=4,
           cross_attn=False, augment=True, teacher_subset=512, w_distill=1.0,
           teacher_off=0.5, teacher_lr=1e-2, teacher_init="", freeze_nerf=True,
           train_encoder=False, unfreeze_last=0, val_n=64, max_input=None,
+          input_pool="canon", mixed_p=0.5,
           collapse_after=None, region=64, render_low=64, render_high=192,
           fg_bias=0.75, workers=6, density_bias=0.0, noise_std=0.0,
-          mask_fg_weight=None,
+          mask_fg_weight=None, w_mask=1.0,
           input_crop=0.0,
           bound=defaults.BOUND, normalize_cams=False, enc_lr_scale=0.1,
           ckpt_dir=None, uids_file="", n_obj=0, tag="", init_from="",
           force_cfg=False,
           snapshot_every=0,
+          seed=0,
           dry_run=False):
     logger = setup_logging()
+    # TEKRAR URETILEBILIRLIK: set_epoch dataset RNG'sini deterministik yapti
+    # ama DataLoader'in shuffle SIRASI global torch RNG'sinden geliyor ve
+    # tohumsuzdu => ayni komutla koşan iki A/B kolu farkli veri sirasi
+    # goruyordu. Tek degiskenli deneyde bu gurultu, kolun kendisi kadar
+    # buyuk olabilir.
+    import random as _random
+    torch.manual_seed(seed); _random.seed(seed); np.random.seed(seed)
     # ETKIN KONFIGURASYON: uzun kosuyu baslatmadan once GORULMESI gereken sey.
     # Bu satir olmadigi icin ortak-ogretmen fazi (teacher_subset=512) fark
     # edilmeden acik kaldi ve 6000 adimlik bir kosunun yarisi bosa gitti;
@@ -268,13 +283,24 @@ def train(train_list, renders_dir, steps=40000, micro_batch=2, grad_accum=4,
                 obje_basina_maruziyet=None, warmup=warmup,
                 warmup_orani=round(warmup / max(steps, 1), 3),
                 lr=lr, enc_lr_scale=enc_lr_scale, w_lpips=w_lpips, w_tv=w_tv,
+                w_mask=w_mask,
                 teacher_subset=teacher_subset, teacher_off=teacher_off,
                 normalize_cams=normalize_cams, train_encoder=train_encoder,
                 unfreeze_last=unfreeze_last, density_bias=density_bias,
                 noise_std=noise_std, bound=bound, region=region,
+                # 2026-09-03: DENETIM DETAY TAVANI. Bu ikisi dump'ta YOKTU --
+                # yani "iki kol gercekten farkli mi" sorusu --dry_run'dan
+                # CEVAPLANAMIYORDU, sadece kosu basladiktan sonraki basliktan.
+                # Dump'in tum varlik sebebi kosuyu baslatmadan dogrulamak.
+                render_low=render_low, render_high=render_high,
                 n_sup=n_sup, render_res=render_res, amp=amp,
                 fg_bias=fg_bias, snapshot_every=snapshot_every,
-                input_crop=input_crop,
+                input_crop=input_crop, seed=seed,
+                # DRY RUN'da GORUNMESI SART: kosuyu degistiren her ayar burada
+                # olmali, yoksa "o bayragi ben vermedim" durumuna dusulur.
+                input_pool=input_pool,
+                mixed_p=(mixed_p if input_pool == "mixed" else "-"),
+                n_samples=n_samples, input_res=defaults.INPUT_RES,
                 mask_fg_weight=('RGB ile ayni (5.0)' if mask_fg_weight is None
                                 else mask_fg_weight),
                 augment=augment, init_from=init_from or '-',
@@ -296,6 +322,10 @@ def train(train_list, renders_dir, steps=40000, micro_batch=2, grad_accum=4,
                           region=region, render_low=render_low,
                           render_high=render_high, fg_bias=fg_bias,
                           input_crop=input_crop,
+                          # GIRDI GORUNUM HAVUZU (S1, 2026-08-29): "canon" =
+                          # eski davranis (girdi daima elev +20). Olculdu:
+                          # girdi elev 55-75'te PSNR -2.44 dB, IoU 0.619->0.419.
+                          input_pool=input_pool, mixed_p=mixed_p,
                           # gorunum rastgeleligi augment'ten BAGIMSIZ olmali:
                           # --no_augment ile deterministik olunca her obje hep ayni
                           # 4 supervision gorunumunu goruyordu (16 render'in 12'si olu)
@@ -415,24 +445,50 @@ def train(train_list, renders_dir, steps=40000, micro_batch=2, grad_accum=4,
     model = LRM(n_samples=n_samples, cross_attn=cross_attn,
                 density_bias=density_bias, noise_std=noise_std,
                 bound=bound).to(device)
-    _cfg_kunye = {'density_bias': density_bias, 'bound': bound}
+    # KUNYE: render sonucunu degistiren HER sey burada olmali. `n_samples` ve
+    # mimari 2026-08-29'a kadar YOKTU -> 48'le egitilmis bir ckpt sessizce 96
+    # ile degerlendirilebiliyordu (fiilen yasandi, elevation olcumunde).
+    _cfg_kunye = {'density_bias': density_bias, 'bound': bound,
+                  'n_samples': n_samples,
+                  'input_res': defaults.INPUT_RES,
+                  'nerf_layers': len([m for m in model.nerf.backbone
+                                      if isinstance(m, torch.nn.Linear)]),
+                  'head_linear': hasattr(model.triplane_head, 'proj'),
+                  'olcek_yontemi': imutil._yontem()}
     if init_from:
         # 3 ASAMALI ZINCIR (fit_teacher -> distill_lrm -> train_lrm) icin:
         # render kaybina SIFIRDAN degil, distile agirliklardan basla.
         # E1 deneyi asama 3'un calistigini gostermisti (24.10 -> 24.99 dB).
         _ck = torch.load(init_from, map_location="cpu", weights_only=False)
-        _cur = {"density_bias": density_bias, "bound": bound}
+        # 2026-09-02 kod incelemesi: kunye n_samples/nerf_layers/head_linear/
+        # input_res ile genisletilmisti ama karsilastirma hala sadece iki alana
+        # bakiyordu => 48 ornekle egitilmis bir ckpt 96 ile SESSIZCE devam
+        # ediyordu -- kunyenin yorumunda "fiilen yasandi" diye yazan senaryo.
+        _cur = {"density_bias": density_bias, "bound": bound,
+                "n_samples": n_samples, "input_res": defaults.INPUT_RES,
+                "nerf_layers": _cfg_kunye["nerf_layers"],
+                "head_linear": _cfg_kunye["head_linear"],
+                "olcek_yontemi": _cfg_kunye["olcek_yontemi"]}
         _saved = _ck.get("render_cfg")
         if _saved is None:
             # Eski format (fit_teacher/distill_lrm kunye yazmiyordu). Zincirin
             # FIILEN kullandigi degerler: TriplaneNeRF(in_dim=96, hidden=64) =>
             # density_bias 0.0 (fit_teacher.py:66), bound defaults.BOUND.
             _saved = {"density_bias": 0.0, "bound": defaults.BOUND}
+            logger.warning("    !! kunyesiz ckpt: n_samples/mimari DOGRULANAMIYOR."
+                           " Zincirin tum asamalarinin ayni degerlerle kosuldugundan"
+                           " ELLE emin ol.")
             logger.warning("    !! %s KUNYESIZ (eski format); zincirin fiili"
                            " varsayilani kabul ediliyor: %s", init_from, _saved)
+        def _ayni(x, y):
+            # olcek_yontemi bir STRING; float() ile karsilastirmak TypeError
+            # verirdi. Sayisal alanlar toleransla, digerleri esitlikle.
+            try:
+                return abs(float(x) - float(y)) <= 1e-9
+            except (TypeError, ValueError):
+                return x == y
         _fark = {k: (_saved.get(k), v) for k, v in _cur.items()
-                 if _saved.get(k) is not None
-                 and abs(float(_saved[k]) - float(v)) > 1e-9}
+                 if _saved.get(k) is not None and not _ayni(_saved[k], v)}
         if _fark and not force_cfg:
             _sat = ["  %s: checkpoint=%s  simdiki=%s" % (k, a_, b_)
                     for k, (a_, b_) in _fark.items()]
@@ -471,7 +527,7 @@ def train(train_list, renders_dir, steps=40000, micro_batch=2, grad_accum=4,
         # encoder.forward @torch.no_grad ile sarili; gradyan aksin diye ac
         model.encoder.forward = model.encoder.forward.__wrapped__.__get__(model.encoder)
 
-    loss_fn = LRMLoss(use_lpips=True, w_lpips=w_lpips,
+    loss_fn = LRMLoss(use_lpips=True, w_lpips=w_lpips, w_mask=w_mask,
                       mask_fg_weight=mask_fg_weight).to(device)
     params = [p for p in model.parameters() if p.requires_grad]
     logger.info(f"egitilebilir parametre: {sum(p.numel() for p in params)/1e6:.1f}M "
@@ -494,10 +550,23 @@ def train(train_list, renders_dir, steps=40000, micro_batch=2, grad_accum=4,
     _enc_ids = {id(q) for q in model.encoder.parameters()}
     _enc_p = [q for q in params if id(q) in _enc_ids]
     _rest_p = [q for q in params if id(q) not in _enc_ids]
-    _groups = [{'params': _rest_p, 'lr': lr}]
+    # WEIGHT DECAY: norm agirliklari ve bias'lar (ndim<=1) HARIC -- referans
+    # pratigi (OpenLRM runners/train/lrm.py). 2026-08-29 olcumu: wd uygulanan
+    # DINOv2 norm.weight'i 0.9659'a buzulmus, yon degisimi ~1e-5 => saf curume,
+    # ogrenme degil. Onceden egitilmis istatistikleri bedelsiz bozuyordu.
+    def _wd_split(ps):
+        return [q for q in ps if q.ndim > 1], [q for q in ps if q.ndim <= 1]
+    _rest_d, _rest_n = _wd_split(_rest_p)
+    _groups = [{'params': _rest_d, 'lr': lr, 'weight_decay': 0.05},
+               {'params': _rest_n, 'lr': lr, 'weight_decay': 0.0}]
     if _enc_p:
-        _groups.append({'params': _enc_p, 'lr': lr * enc_lr_scale})
+        _enc_d, _enc_n = _wd_split(_enc_p)
+        _groups.append({'params': _enc_d, 'lr': lr * enc_lr_scale, 'weight_decay': 0.05})
+        _groups.append({'params': _enc_n, 'lr': lr * enc_lr_scale, 'weight_decay': 0.0})
         logger.info(f'encoder param grubu: {sum(q.numel() for q in _enc_p)/1e6:.1f}M @ lr*{enc_lr_scale} = {lr*enc_lr_scale:.2e}')
+    _groups = [g for g in _groups if g['params']]
+    logger.info('wd=0 param sayisi (norm/bias): '
+                f"{sum(len(g['params']) for g in _groups if g['weight_decay'] == 0.0)}")
     opt = torch.optim.AdamW(_groups, lr=lr, weight_decay=0.05, betas=(0.9, 0.95))
 
     def lr_lambda(s):
@@ -622,10 +691,12 @@ def train(train_list, renders_dir, steps=40000, micro_batch=2, grad_accum=4,
                 prem = to(it["sup_premult"])
                 res_i = it["sup_res"]
                 if cur_res is not None and cur_res != res_i:
-                    alpha = F.interpolate(alpha, size=(cur_res, cur_res), mode="bilinear",
-                                          align_corners=False)
-                    prem = F.interpolate(prem, size=(cur_res, cur_res), mode="bilinear",
-                                         align_corners=False)
+                    # prem ZATEN premultiply edilmis; ikisi de alan ortalamasi
+                    # ile kucultulur (lrm/imutil.py). Bu yol kaba-ince faz
+                    # kapali oldugu icin (coarse_frac 0) dormant, ama ayni
+                    # takma-ad hatasini tasiyordu.
+                    alpha = imutil.kucult(alpha, cur_res)
+                    prem = imutil.kucult(prem, cur_res)
                     res_i = cur_res
                 c = torch.rand(3, device=device)
                 target = prem + (1.0 - alpha) * c[None, :, None, None]
@@ -749,8 +820,8 @@ def train(train_list, renders_dir, steps=40000, micro_batch=2, grad_accum=4,
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--train_list", default="dataset/train_list.json")
-    ap.add_argument("--renders_dir", default="dataset/renders")
+    ap.add_argument("--train_list", default="dataset/train_list_v2.json")
+    ap.add_argument("--renders_dir", default="dataset/renders_opp_score3")
     ap.add_argument("--steps", type=int, default=40000)
     ap.add_argument("--micro_batch", type=int, default=2)
     ap.add_argument("--grad_accum", type=int, default=4)
@@ -765,7 +836,7 @@ if __name__ == "__main__":
     # DIKKAT: bf16 renk gradyanini olduruyor (sadece geometri ogreniliyor, renk siyah
     # kaliyor). Bu yuzden VARSAYILAN fp32. Hiz icin bilerek bf16 istersen --amp.
     ap.add_argument("--amp", action="store_true",
-                    help="bf16 mixed precision (DIKKAT: rengi ogrenmiyor, sadece hiz denemesi icin)")
+                    help="bf16 mixed precision. ESKI UYARI ('rengi ogrenmiyor') 2026-08-26'da CURUTULDU (K2): renderer bf16'da bagil hata 0.0003, sayisal sorun YOK. Coken kol density_bias=0 yuzunden acc->0 sogurucu durumuna dusuyordu; --density_bias 1.0 ile bf16 EN IYI koldu (15.52 -> 18.42 dB).")
     ap.add_argument("--grad_ckpt", action="store_true",
                     help="gradient checkpointing (VRAM darsa; varsayilan kapali)")
     ap.add_argument("--n_samples", type=int, default=defaults.N_SAMPLES,
@@ -791,6 +862,18 @@ if __name__ == "__main__":
                     help="girdi fotosunu siluet bbox'ina KARE kirp (pay carpani, "
                          "1.15 onerilir). Olculdu: kaplama 0.092 -> 0.250 (2.7x), "
                          "DINOv2 patch 24 -> 64. Faz C zaten bunu yapacak. 0 = kapali.")
+    ap.add_argument("--w_mask", type=float, default=0.25,
+                    help="OLCULDU 2026-09-02 (1024 obje, 6000 adim, tek "
+                         "degisken): IC OPTIMUM 0.25. Uc kol -- 0.0 / 0.25 / "
+                         "1.0 -- ve yalnizca 0.25 ortalama-blob tabanini "
+                         "(17.48 dB) gecti: PSNR 17.88 (0.0 icin 16.53, 1.0 "
+                         "icin 17.09), top-1 15.6%% (10.9 / 9.4), "
+                         "acc/GT_alfa 1.14x (2.40x / 1.40x; GT alfa ort "
+                         "0.0876). 0 ise model sisle dolduruyor; 1.0 ise alfa "
+                         "terimi kaybi yiyip kosullandirmayi bastiriyor. "
+                         "UYARI: 1024 objede olculdu ve bu projede olcege "
+                         "bagli kirilan sonuc var (ogretmen numarasi). Tam "
+                         "kosuda acc/GT > 1.6 gorursen 0.5e cikar.")
     ap.add_argument("--mask_fg_weight", type=float, default=None,
                     help="mask kaybinda on-plan agirligi (None=RGB ile ayni, 5.0). "
                          "0.0 = tekdusze mask => arka planin BOS olmasi sinyali 3.5x "
@@ -833,6 +916,8 @@ if __name__ == "__main__":
     ap.add_argument("--dry_run", action="store_true",
                     help="ETKIN konfigurasyonu yaz ve CIK. Uzun kosudan once "
                          "niyetle karsilastirmak icin -- 10 saniye, saatler kurtarir.")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="veri sirasi + init tohumu (A/B kollari icin SABIT tut)")
     ap.add_argument("--snapshot_every", type=int, default=0,
                     help="her N adimda EZILMEYEN arsiv checkpointi yaz. "
                          "last_*.pt surekli ezildigi icin, kalite ortada tepe "
@@ -862,6 +947,14 @@ if __name__ == "__main__":
                     help="DINOv2'nin TAMAMINI egit")
     ap.add_argument("--unfreeze_last", type=int, default=0,
                     help="DINOv2'nin son N blogunu egit (0=donuk)")
+    ap.add_argument("--input_pool", default="canon",
+                    choices=["canon", "mixed", "all"],
+                    help="girdi gorunum havuzu. canon=sadece 4 kanonik (girdi "
+                         "elev DAIMA +20, eski davranis); mixed=mixed_p olasilikla "
+                         "16 goruunumun tamami; all=daima tamami. Referanslarin "
+                         "HICBIRI girdi elevation'ini sabitlemiyor.")
+    ap.add_argument("--mixed_p", type=float, default=0.5,
+                    help="--input_pool mixed ile: tam havuz kullanma olasiligi")
     ap.add_argument("--val_n", type=int, default=64,
                     help="sayisal val'de kullanilacak gorulmemis obje sayisi")
     ap.add_argument("--collapse_after", type=int, default=None,
@@ -883,13 +976,14 @@ if __name__ == "__main__":
           teacher_init=a.teacher_init, freeze_nerf=not a.no_freeze_nerf,
           train_encoder=a.train_encoder, unfreeze_last=a.unfreeze_last,
           val_n=a.val_n, max_input=a.max_input,
+          input_pool=a.input_pool, mixed_p=a.mixed_p,
           collapse_after=a.collapse_after, region=a.region,
           render_low=a.render_low, render_high=a.render_high,
           fg_bias=a.fg_bias, workers=a.workers,
-          mask_fg_weight=a.mask_fg_weight,
+          mask_fg_weight=a.mask_fg_weight, w_mask=a.w_mask,
           input_crop=a.input_crop,
           density_bias=a.density_bias, noise_std=a.noise_std, bound=a.bound,
           normalize_cams=a.normalize_cams, enc_lr_scale=a.enc_lr_scale,
           ckpt_dir=a.ckpt_dir, uids_file=a.uids_file, n_obj=a.n_obj, tag=a.tag,
           init_from=a.init_from, force_cfg=a.force_cfg,
-          snapshot_every=a.snapshot_every, dry_run=a.dry_run)
+          snapshot_every=a.snapshot_every, seed=a.seed, dry_run=a.dry_run)

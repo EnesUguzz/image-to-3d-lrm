@@ -32,6 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lrm.model import LRM
 from lrm.losses import LRMLoss
 from lrm import runstamp
+from lrm import defaults
 
 DEV = "cuda"
 OUT = "dataset/lrm_bench"
@@ -48,7 +49,10 @@ def _timeit(fn, n=8, warmup=3):
     return (time.time() - t0) / n * 1000.0
 
 
-def _fake_batch(n_input, n_sup, render_res, input_res=224):
+def _fake_batch(n_input, n_sup, render_res, input_res=None):
+    # 2026-08-29: sabit 224 idi -> defaults.INPUT_RES degistiginde olcum SESSIZCE
+    # eski cozunurlugu olcuyordu (336 ile 224 birebir ayni sure cikti).
+    input_res = defaults.INPUT_RES if input_res is None else input_res
     """Sentetik girdi: hiz olcumu icin veri icerigi onemsiz, SEKIL onemli."""
     ii = torch.rand(n_input, 3, input_res, input_res, device=DEV)
     ic = torch.eye(4, device=DEV)[None].repeat(n_input, 1, 1)
@@ -84,7 +88,7 @@ def main():
     ap.add_argument("--render_res", type=int, default=128)
     ap.add_argument("--n_sup", type=int, default=4)
     ap.add_argument("--n_input", type=int, default=2)
-    ap.add_argument("--n_samples", type=int, default=48)
+    ap.add_argument("--n_samples", type=int, default=defaults.N_SAMPLES)
     ap.add_argument("--w_lpips", type=float, default=0.25)
     ap.add_argument("--iters", type=int, default=8)
     ap.add_argument("--data", action="store_true",

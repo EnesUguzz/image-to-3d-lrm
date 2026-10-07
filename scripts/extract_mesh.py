@@ -177,6 +177,46 @@ def mean_iou(mesh, renders_dir, uid, views=(0, 1, 2, 3)):
     return sum(silhouette_iou(mesh, renders_dir, uid, v) for v in views) / len(views)
 
 
+def photo_iou(mesh, photo_dir, renders_dir, res=128, n_pts=120000,
+              names=("on", "sag", "arka", "sol")):
+    """GERCEK foto icin siluet IoU: kamera kanonik varsayilir, maske fotonun
+    kendi alfasidir (arka plan zaten silinmis). GT render'a ihtiyac YOK."""
+    import numpy as np
+    from PIL import Image
+    u0 = sorted(os.listdir(renders_dir))[0]
+    with open(os.path.join(renders_dir, u0, "meta.json"), encoding="utf-8") as f:
+        meta = json.load(f)
+    master = meta.get("resolution", 512)
+    pts = mesh.sample(n_pts)
+    tot = 0.0
+    _sayi = 0
+    for k, nm in enumerate(names):
+        f_png = os.path.join(photo_dir, nm + ".png")
+        if not os.path.isfile(f_png):
+            continue
+        v = meta["views"][meta["canonical_indices"][k]]
+        K = cameras.scale_intrinsics(torch.tensor(v["intrinsic"], dtype=torch.float32),
+                                     master, res).numpy()
+        ext = np.array(v["extrinsic"], dtype=np.float64)
+        P = (ext[:3, :3] @ pts.T).T + ext[:3, 3]
+        z = -P[:, 2]; ok = z > 1e-6
+        u = K[0, 0] * (P[ok, 0] / z[ok]) + K[0, 2]
+        w = -K[1, 1] * (P[ok, 1] / z[ok]) + K[1, 2]
+        m = np.zeros((res, res), bool)
+        ui, wi = np.round(u).astype(int), np.round(w).astype(int)
+        g = (ui >= 0) & (ui < res) & (wi >= 0) & (wi < res)
+        m[wi[g], ui[g]] = True
+        gt = np.asarray(Image.open(f_png).convert("RGBA").resize((res, res)))[:, :, 3] > 16
+        tot += float((m & gt).sum() / max((m | gt).sum(), 1))
+        _sayi += 1
+    # PAYDA ISLENEN FOTO SAYISI OLMALI (2026-09-02 kod incelemesi): eksik
+    # fotograflar `continue` ile atlaniyor ama bolme her zaman len(names)=4'e
+    # yapiliyordu => 2 fotoluk bir prep_photo ciktisinda gercek 0.60 IoU
+    # rapora 0.30 diye giriyor, ve bu olcekli sayi otomatik esik tablosuna ve
+    # .json yan dosyasina "iou" olarak yaziliyor.
+    return tot / max(_sayi, 1)
+
+
 def clean(mesh, min_face_frac=0.01):
     """Kucuk yuzen parcalari at, dejenere ucgenleri temizle."""
     import trimesh
@@ -204,6 +244,10 @@ def main():
     ap.add_argument("--index", type=int, default=0, help="ogretmen bankasindaki obje indeksi")
     ap.add_argument("--ckpt", default="", help="egitilmis LRM checkpoint'i")
     ap.add_argument("--uid", default="", help="--ckpt ile: bu objenin fotosundan uret")
+    ap.add_argument("--photos", default="",
+                    help="--ckpt ile: prep_photo.py ciktisi klasoru (on/sag/arka/sol.png)")
+    ap.add_argument("--n_input", type=int, default=2,
+                    help="--photos ile: kac goruum girdi verilecek (olculdu: 1 yetersiz)")
     ap.add_argument("--renders_dir", default="dataset/renders_opp_score3")
     ap.add_argument("--grid", type=int, default=128)
     ap.add_argument("--bound", type=float, default=defaults.BOUND)
@@ -227,6 +271,40 @@ def main():
         uid = tk["uids"][a.index]
         bound = tk.get("cfg", {}).get("bound", a.bound)
         print(f"oracle triplane: {uid} (index {a.index}), bound {bound}")
+    elif a.ckpt and a.photos:
+        from lrm.model import LRM
+        import numpy as _np
+        from PIL import Image as _Im
+        model = LRM().to(DEV).eval()
+        model.load_state_dict(torch.load(a.ckpt, map_location="cpu",
+                                         weights_only=False)["model"])
+        u0 = sorted(os.listdir(a.renders_dir))[0]
+        with open(os.path.join(a.renders_dir, u0, "meta.json"), encoding="utf-8") as f:
+            _m = json.load(f)
+        master = _m.get("resolution", 512)
+        names = ["on", "sag", "arka", "sol"][:a.n_input]
+        imgs, c2ws, Ks = [], [], []
+        for k, nm in enumerate(names):
+            v = _m["views"][_m["canonical_indices"][k]]
+            im = _Im.open(os.path.join(a.photos, nm + ".png")).convert("RGBA")
+            # SABIT 224 DEGIL (2026-09-02): LRM.make_triplane Plucker haritasini
+            # self.INPUT_RES olceginde kuruyor. Burada 224 sabit kalirsa
+            # INPUT_RES degistigi an goruntu/intrinsic ile Plucker SESSIZCE
+            # ayrisir -- ve girdi cozunurlugunu yukseltmek planin bir maddesi.
+            im = im.resize((defaults.INPUT_RES,) * 2, _Im.LANCZOS)
+            t = torch.from_numpy(_np.array(im)).float().permute(2, 0, 1) / 255.
+            imgs.append(t[:3] * t[3:4] + (1 - t[3:4]))
+            Ks.append(cameras.scale_intrinsics(
+                torch.tensor(v["intrinsic"], dtype=torch.float32), master,
+                defaults.INPUT_RES))
+            c2ws.append(torch.linalg.inv(torch.tensor(v["extrinsic"], dtype=torch.float32)))
+        with torch.no_grad():
+            triplane = model.make_triplane(torch.stack(imgs).to(DEV),
+                                           torch.stack(c2ws).to(DEV),
+                                           torch.stack(Ks).to(DEV))
+        nerf, bound = model.nerf, model.bound
+        uid = a.tag
+        print(f"GERCEK FOTO: {a.photos}  ({a.n_input} goruum: {', '.join(names)})")
     elif a.ckpt:
         from lrm.model import LRM
         from lrm.dataset import _load_rgba
@@ -237,10 +315,12 @@ def main():
         with open(os.path.join(a.renders_dir, uid, "meta.json"), encoding="utf-8") as f:
             meta = json.load(f)
         v = meta["views"][meta["canonical_indices"][0]]
-        rgba = _load_rgba(os.path.join(a.renders_dir, uid, v["file"]), 224)
+        rgba = _load_rgba(os.path.join(a.renders_dir, uid, v["file"]),
+                          defaults.INPUT_RES)
         img = (rgba[:3] * rgba[3:4] + (1 - rgba[3:4]))[None].to(DEV)
         K = cameras.scale_intrinsics(torch.tensor(v["intrinsic"], dtype=torch.float32),
-                                     meta.get("resolution", 512), 224)[None].to(DEV)
+                                     meta.get("resolution", 512),
+                                     defaults.INPUT_RES)[None].to(DEV)
         c2w = torch.linalg.inv(torch.tensor(v["extrinsic"], dtype=torch.float32))[None].to(DEV)
         with torch.no_grad():
             triplane = model.make_triplane(img, c2w, K)
@@ -273,7 +353,9 @@ def main():
     levels = ([a.level] if a.level > 0 else
               sorted({round(float(torch.quantile(pos, q)), 4) for q in
                       (0.20, 0.40, 0.60, 0.75, 0.90)}))
-    if a.auto_level and os.path.isdir(os.path.join(a.renders_dir, uid)):
+    _auto_ok = a.auto_level and (bool(a.photos) or
+                                os.path.isdir(os.path.join(a.renders_dir, uid)))
+    if _auto_ok:
         # esigi GT silüetine gore sec: yogunluk olcegi objeden objeye degisiyor
         lo, hi = float(pos.min()), float(pos.max())
         cand = sorted({round(float(v), 4) for v in
@@ -284,7 +366,9 @@ def main():
             if mm is None or len(mm.faces) < 200:
                 continue
             mm = clean(mm)
-            scored.append((mean_iou(mm, a.renders_dir, uid), lv, mm))
+            _iou = (photo_iou(mm, a.photos, a.renders_dir) if a.photos
+                    else mean_iou(mm, a.renders_dir, uid))
+            scored.append((_iou, lv, mm))
         if scored:
             scored.sort(reverse=True, key=lambda t: t[0])
             print("  otomatik esik taramasi (IoU):")

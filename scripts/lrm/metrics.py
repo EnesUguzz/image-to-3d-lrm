@@ -22,6 +22,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from lrm import imutil
+
 # hi_iyi = buyuk deger daha iyi  ->  kotu uc p10'da
 YUKSEK_IYI = ("psnr", "ssim", "clip", "iou", "top1", "fscore", "precision",
               "recall", "normal", "gt_siluet")
@@ -104,6 +106,7 @@ def clip_per_object(P, G, device="cuda"):
     m, mean, std = clip_model(device)
 
     def emb(x):
+        # OLCEK-DENETIMI: buyutme (deger cozunurlugu <= 224; CLIP girisi 224)
         x = F.interpolate(x.float(), size=(224, 224), mode="bicubic", align_corners=False)
         return F.normalize(m.encode_image((x.clamp(0, 1) - mean) / std).float(), dim=-1)
 
@@ -145,8 +148,7 @@ def neighbor_indices(inputs, res=32):
     "tani ve en yakin egitim seklini getir" yapiyor. Model bu baseline'i
     yenmiyorsa rekonstruksiyon yaptigi soylenemez.
     """
-    X = F.interpolate(inputs.float(), size=(res, res), mode="bilinear",
-                      align_corners=False)
+    X = imutil.kucult(inputs.float(), res)   # 224->32: 7x kucultme, alan ort.
     D = ((X[:, None] - X[None]) ** 2).mean(tuple(range(2, X.dim() + 1)))
     D.fill_diagonal_(float("inf"))
     return D.argmin(1)

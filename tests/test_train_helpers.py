@@ -31,7 +31,9 @@ def test_checkpoint_roundtrip(tmp_path):
     step, teacher, opt_t = load_checkpoint(p, m2, opt2, sched2)
     assert step == 123
     assert teacher is None and opt_t is None   # ogretmensiz checkpoint
-    assert torch.allclose(m.triplane_head.proj.weight, m2.triplane_head.proj.weight)
+    # 2026-08-29: TriplaneHead.proj (Linear darbogazi) kaldirildi, agirlik
+    # artik dogrudan deconv uzerinde. bkz. tests/test_triplane_rank.py
+    assert torch.allclose(m.triplane_head.up.weight, m2.triplane_head.up.weight)
 
 
 def test_checkpoint_ogretmeni_de_saklar(tmp_path):

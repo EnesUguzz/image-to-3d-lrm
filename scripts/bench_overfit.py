@@ -6,7 +6,7 @@ import numpy as np, torch
 import torch.nn.functional as F
 from PIL import Image
 sys.path.insert(0, os.path.dirname(__file__))
-from lrm import cameras
+from lrm import cameras, imutil
 from lrm import defaults
 from lrm import guards, runstamp
 from lrm.model import LRM
@@ -19,7 +19,7 @@ SUP_VIEWS = [4, 7, 10, 13]
 # rekonstruksiyonu ayirir -- egitimde gorulen acidan render etmek yaniltici olabilir.
 NOVEL_VIEW = 8
 OUT = "dataset/lrm_bench"
-RENDER_DIR = "dataset/renders"   # --render_dir ile degistirilir
+RENDER_DIR = "dataset/renders_opp_score3"   # --render_dir ile degistirilir
 
 
 def load_view(uid, view, res, crop=1.0):
@@ -34,7 +34,7 @@ def load_view(uid, view, res, crop=1.0):
         H = a.shape[-1]
         m = int(round(H * (1 - crop) / 2))
         a = a[..., m:H - m, m:H - m]
-    a = F.interpolate(a[None], size=(res, res), mode="bilinear", align_corners=False)[0]
+    a = imutil.kucult_rgba(a, res)      # alan ort. + premultiply sirasi
     K = cameras.scale_intrinsics(torch.tensor(v["intrinsic"], dtype=torch.float32),
                                  meta.get("resolution", 512), res)
     if crop < 1.0:
@@ -67,8 +67,8 @@ def sample_fg_crop(d, res, rng, smin=0.45, smax=1.0, jitter=0.4):
     ox = int(min(max(ox, 0), HI - w)); oy = int(min(max(oy, 0), HI - w))
     pr = prem_hi[..., oy:oy + w, ox:ox + w]
     al = alpha_hi[..., oy:oy + w, ox:ox + w]
-    pr = F.interpolate(pr, size=(res, res), mode="bilinear", align_corners=False)
-    al = F.interpolate(al, size=(res, res), mode="bilinear", align_corners=False)
+    pr = imutil.kucult(pr, res)         # premultiply ZATEN yapilmis; alan ort.
+    al = imutil.kucult(al, res)
     f = res / w
     K = K_hi.clone()
     K[:, 0, 0] *= f; K[:, 1, 1] *= f
@@ -162,7 +162,12 @@ def main():
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--res", type=int, default=64)
     ap.add_argument("--lr", type=float, default=4e-4)
-    ap.add_argument("--w_lpips", type=float, default=2.0)
+    # 2026-09-02 kod incelemesi B3: varsayilan 2.0 idi. CLAUDE.md'de
+    # OLCULEREK terk edilmis deger: LPIPS baskin olunca model "ortalama
+    # obje" havzasinda kaliyor (32 obje: top-1 %25 -> %62, 0.25'te).
+    # train_lrm ve fit_teacher 0.25 kullaniyor; KAPI ARACI egitimden
+    # farkli bir tarifeyi olcuyordu. tests/test_kunye_uyumu.py hizayi tutar.
+    ap.add_argument("--w_lpips", type=float, default=0.25)
     ap.add_argument("--lpips_start", type=float, default=0.0,
                     help="LPIPS'i egitimin bu orani gectikten SONRA devreye sok "
                          "(0=bastan acik). Olculdu: LPIPS bastan acikken model "
@@ -201,9 +206,9 @@ def main():
                          "A/B kollarini bununla sabitle: '--n_obj 32' ile listeden "
                          "adimlamak train_list her yeniden uretildiginde BASKA objeler "
                          "verir (bkz. PROJE-DEVIR-BELGESI 7.1).")
-    ap.add_argument("--render_dir", default="dataset/renders",
+    ap.add_argument("--render_dir", default="dataset/renders_opp_score3",
                     help="render kok dizini (yeni set: dataset/renders_opp_score3)")
-    ap.add_argument("--train_list", default="dataset/train_list.json",
+    ap.add_argument("--train_list", default="dataset/train_list_v2.json",
                     help="uid listesi json (train/val anahtarli)")
     a = ap.parse_args()
     os.makedirs(OUT, exist_ok=True)
